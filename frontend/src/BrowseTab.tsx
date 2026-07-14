@@ -85,7 +85,7 @@ export default function BrowseTab({ detection, contentType, installDir, onInstal
   const [results, setResults] = useState<DisplayProject[]>([]);
   const [totalHits, setTotalHits] = useState(0);
   const [loading, setLoading] = useState(false);
-  const searchTimer = useRef<ReturnType<typeof setTimeout>>();
+  const searchTimer = useRef<ReturnType<typeof setTimeout>>(null);
 
   // Detail modal
   const [selectedProject, setSelectedProject] = useState<DisplayProject | null>(null);
@@ -512,10 +512,12 @@ export default function BrowseTab({ detection, contentType, installDir, onInstal
                       const url = getExternalUrl(selectedProject);
                       return url ? (
                         <Button
-                          size='compact-xs' variant='subtle' component='a'
-                          href={url} target='_blank'
+                          size='compact-xs' variant='subtle'
                           leftSection={<FontAwesomeIcon icon={faExternalLink} />}
-                          onClick={(e: React.MouseEvent) => e.stopPropagation()}
+                          onClick={(e: React.MouseEvent) => {
+                            e.stopPropagation();
+                            window.open(url, '_blank', 'noopener');
+                          }}
                         >
                           View
                         </Button>
@@ -595,7 +597,7 @@ export default function BrowseTab({ detection, contentType, installDir, onInstal
                         loading={installing && installState !== 'error'}
                         disabled={
                           !hasSelection || !hasVersions
-                          || (selectedProject.source === 'curseforge' && selectedCfFile && !selectedCfFile.downloadUrl)
+                          || !!(selectedProject.source === 'curseforge' && selectedCfFile && !selectedCfFile.downloadUrl)
                         }
                         color={installState === 'error' ? 'red' : existingFile ? 'yellow' : undefined}
                         size='sm'

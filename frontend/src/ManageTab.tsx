@@ -49,7 +49,7 @@ interface IdentifiedContent {
 
 export default function ManageTab({ detection, contentType, installDir, refreshKey }: ManageTabProps) {
   const { addToast } = useToast();
-  const { server } = useServerStore();
+  const { server, state } = useServerStore();
 
   const [loading, setLoading] = useState(true);
   const [items, setItems] = useState<IdentifiedContent[]>([]);
@@ -225,7 +225,7 @@ export default function ManageTab({ detection, contentType, installDir, refreshK
     }
   }, [contentType, server.uuid, loadInstalled]);
 
-  const isRunning = server.status === 'running' || server.status === 'starting';
+  const isRunning = state === 'running' || state === 'starting';
 
   return (
     <div className='ci-manage'>
@@ -281,10 +281,14 @@ export default function ManageTab({ detection, contentType, installDir, refreshK
                   <Button
                     size='xs'
                     variant='subtle'
-                    component='a'
-                    href={`https://modrinth.com/${item.project.project_type}/${item.project.slug}`}
-                    target='_blank'
                     leftSection={<FontAwesomeIcon icon={faExternalLink} />}
+                    onClick={() => {
+                      window.open(
+                        `https://modrinth.com/${item.project!.project_type}/${item.project!.slug}`,
+                        '_blank',
+                        'noopener',
+                      );
+                    }}
                   >
                     Details
                   </Button>
@@ -312,7 +316,9 @@ export default function ManageTab({ detection, contentType, installDir, refreshK
         title={<Text fw={600}>Remove {confirmRemove?.project?.title ?? confirmRemove?.file.name}</Text>}
         confirm='Remove'
         confirmColor='red'
-        onConfirmed={() => confirmRemove && doRemove(confirmRemove)}
+        onConfirmed={() => {
+          if (confirmRemove) doRemove(confirmRemove);
+        }}
       >
         <Text size='sm'>
           This will delete <strong>{confirmRemove?.file.name}</strong> from the {contentType} directory.

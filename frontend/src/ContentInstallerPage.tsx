@@ -44,7 +44,7 @@ export default function ContentInstallerPage() {
     detectServer(
       server.uuid,
       server.egg.name,
-      server.startup ?? server.egg.startup,
+      server.startup,
       server.image ?? '',
     ).then((result) => {
       setDetection(result);

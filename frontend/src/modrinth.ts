@@ -106,7 +106,7 @@ export type SearchIndex = 'relevance' | 'downloads' | 'follows' | 'newest' | 'up
  */
 export async function searchProjects(opts: {
   query?: string;
-  projectType?: 'mod' | 'plugin' | 'datapack';
+  projectType?: 'mod' | 'plugin' | 'datapack' | 'modpack';
   loaders?: string[];
   gameVersions?: string[];
   categories?: string[];

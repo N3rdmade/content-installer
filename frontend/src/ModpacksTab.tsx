@@ -75,7 +75,7 @@ interface ModpackProgress {
 
 export default function ModpacksTab({ detection }: ModpacksTabProps) {
   const { addToast } = useToast();
-  const { server } = useServerStore();
+  const { server, state } = useServerStore();
 
   const [source, setSource] = useState<Source>('modrinth');
   const [cfAvailable, setCfAvailable] = useState<boolean | null>(null);
@@ -86,7 +86,7 @@ export default function ModpacksTab({ detection }: ModpacksTabProps) {
   const [results, setResults] = useState<DisplayModpack[]>([]);
   const [totalHits, setTotalHits] = useState(0);
   const [loading, setLoading] = useState(false);
-  const searchTimer = useRef<ReturnType<typeof setTimeout>>();
+  const searchTimer = useRef<ReturnType<typeof setTimeout>>(null);
 
   // Install modal
   const [selectedModpack, setSelectedModpack] = useState<DisplayModpack | null>(null);
@@ -107,7 +107,7 @@ export default function ModpacksTab({ detection }: ModpacksTabProps) {
   const [cleanInstall, setCleanInstall] = useState(true);
   const [acceptRisk, setAcceptRisk] = useState(false);
 
-  const isRunning = server.status === 'running' || server.status === 'starting';
+  const isRunning = state === 'running' || state === 'starting';
 
   useEffect(() => {
     checkCurseForgeStatus(server.uuid).then(setCfAvailable);
@@ -454,16 +454,20 @@ export default function ModpacksTab({ detection }: ModpacksTabProps) {
                       {selectedModpack.source === 'curseforge' ? 'CurseForge' : 'Modrinth'}
                     </Badge>
                     {selectedModpack.source === 'modrinth' && selectedModpack.modrinthProject && (
-                      <Button size='compact-xs' variant='subtle' component='a'
-                        href={`https://modrinth.com/modpack/${selectedModpack.modrinthProject.slug}`}
-                        target='_blank' leftSection={<FontAwesomeIcon icon={faExternalLink} />}
-                        onClick={(e: React.MouseEvent) => e.stopPropagation()}>View</Button>
+                      <Button size='compact-xs' variant='subtle'
+                        leftSection={<FontAwesomeIcon icon={faExternalLink} />}
+                        onClick={(e: React.MouseEvent) => {
+                          e.stopPropagation();
+                          window.open(`https://modrinth.com/modpack/${selectedModpack.modrinthProject!.slug}`, '_blank', 'noopener');
+                        }}>View</Button>
                     )}
                     {selectedModpack.source === 'curseforge' && selectedModpack.curseforgeProject && (
-                      <Button size='compact-xs' variant='subtle' component='a'
-                        href={`https://www.curseforge.com/minecraft/modpacks/${selectedModpack.curseforgeProject.slug}`}
-                        target='_blank' leftSection={<FontAwesomeIcon icon={faExternalLink} />}
-                        onClick={(e: React.MouseEvent) => e.stopPropagation()}>View</Button>
+                      <Button size='compact-xs' variant='subtle'
+                        leftSection={<FontAwesomeIcon icon={faExternalLink} />}
+                        onClick={(e: React.MouseEvent) => {
+                          e.stopPropagation();
+                          window.open(`https://www.curseforge.com/minecraft/modpacks/${selectedModpack.curseforgeProject!.slug}`, '_blank', 'noopener');
+                        }}>View</Button>
                     )}
                   </Group>
                   <Group gap='xs'>
