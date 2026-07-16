@@ -1,13 +1,11 @@
 import { faExclamationTriangle } from '@fortawesome/free-solid-svg-icons';
 import { FontAwesomeIcon } from '@fortawesome/react-fontawesome';
-import {
-  Group,
-  Loader,
-  SegmentedControl,
-  Text,
-  Title,
-} from '@mantine/core';
+import { Loader } from '@mantine/core';
 import Alert from '@/elements/Alert.tsx';
+import Group from '@/elements/Group.tsx';
+import SegmentedControl from '@/elements/SegmentedControl.tsx';
+import Text from '@/elements/Text.tsx';
+import Title from '@/elements/Title.tsx';
 import Badge from '@/elements/Badge.tsx';
 import Select from '@/elements/input/Select.tsx';
 import { useEffect, useState } from 'react';

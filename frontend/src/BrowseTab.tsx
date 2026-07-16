@@ -1,17 +1,15 @@
 import { marked } from 'marked';
 import { faArrowDown, faCheck, faExternalLink, faRefresh, faSearch } from '@fortawesome/free-solid-svg-icons';
 import { FontAwesomeIcon } from '@fortawesome/react-fontawesome';
-import {
-  Group,
-  Loader,
-  SegmentedControl,
-  Stack,
-  Text,
-} from '@mantine/core';
+import { Loader } from '@mantine/core';
 import { faArrowUp } from '@fortawesome/free-solid-svg-icons';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { axiosInstance } from '@/api/axios.ts';
 import Alert from '@/elements/Alert.tsx';
+import Group from '@/elements/Group.tsx';
+import SegmentedControl from '@/elements/SegmentedControl.tsx';
+import Stack from '@/elements/Stack.tsx';
+import Text from '@/elements/Text.tsx';
 import Badge from '@/elements/Badge.tsx';
 import Button from '@/elements/Button.tsx';
 import Card from '@/elements/Card.tsx';
@@ -102,7 +100,14 @@ export default function BrowseTab({ detection, contentType, installDir, onInstal
   const [installing, setInstalling] = useState(false);
   const [existingFile, setExistingFile] = useState<string | null>(null);
 
-  const modrinthLoaders = contentType === 'datapacks' ? ['datapack'] : (LOADER_TO_MODRINTH[detection.loader] ?? []);
+  // Stable ref — an inline array literal here changes identity every render, which
+  // cascades through doModrinthSearch → doSearch → the search effect and loops forever
+  // (React #185). LOADER_TO_MODRINTH entries are module-level constants, so only the
+  // datapacks branch needs memoizing.
+  const modrinthLoaders = useMemo(
+    () => (contentType === 'datapacks' ? ['datapack'] : (LOADER_TO_MODRINTH[detection.loader] ?? [])),
+    [contentType, detection.loader],
+  );
   const cfModLoaderType = LOADER_TO_CURSEFORGE[detection.loader] ?? 0;
   const cfClassId = contentType === 'datapacks' ? CF_CLASS_DATAPACKS
     : contentType === 'plugins' ? CF_CLASS_PLUGINS : CF_CLASS_MODS;

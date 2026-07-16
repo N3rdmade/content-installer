@@ -1,15 +1,13 @@
 import { marked } from 'marked';
 import { faArrowDown, faCheck, faExclamationTriangle, faExternalLink, faSearch, faSpinner } from '@fortawesome/free-solid-svg-icons';
 import { FontAwesomeIcon } from '@fortawesome/react-fontawesome';
-import {
-  Group,
-  Loader,
-  SegmentedControl,
-  Stack,
-  Text,
-} from '@mantine/core';
+import { Loader } from '@mantine/core';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import Alert from '@/elements/Alert.tsx';
+import Group from '@/elements/Group.tsx';
+import SegmentedControl from '@/elements/SegmentedControl.tsx';
+import Stack from '@/elements/Stack.tsx';
+import Text from '@/elements/Text.tsx';
 import Badge from '@/elements/Badge.tsx';
 import Button from '@/elements/Button.tsx';
 import Card from '@/elements/Card.tsx';

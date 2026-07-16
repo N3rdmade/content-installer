@@ -1,6 +1,10 @@
 import { faCheck, faKey } from '@fortawesome/free-solid-svg-icons';
 import { FontAwesomeIcon } from '@fortawesome/react-fontawesome';
-import { Alert, Group, Loader, Stack, Text, TextInput, Title } from '@mantine/core';
+import { Alert, Loader, TextInput } from '@mantine/core';
+import Group from '@/elements/Group.tsx';
+import Stack from '@/elements/Stack.tsx';
+import Text from '@/elements/Text.tsx';
+import Title from '@/elements/Title.tsx';
 import { useEffect, useState } from 'react';
 import Button from '@/elements/Button.tsx';
 
