@@ -251,10 +251,33 @@
    Manage Tab
    ======================================== */
 
-.ci-installed-grid {
+.ci-installed-toolbar {
   display: flex;
-  flex-direction: column;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 12px;
+}
+
+.ci-installed-filter {
+  flex: 1;
+  max-width: 340px;
+}
+
+/* Two-up on wide screens, single column below ~1100px */
+.ci-installed-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(480px, 1fr));
   gap: 6px;
+}
+
+/* Filter bar (browse, #14) */
+.ci-filter-bar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-top: 8px;
+  margin-bottom: 12px;
 }
 
 /* Mantine Card root is display:flex + flex-direction:column (for Card.Section).
@@ -307,6 +330,14 @@
   .ci-search-bar {
     flex-direction: column;
     align-items: stretch;
+  }
+
+  .ci-installed-grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .ci-installed-toolbar {
+    flex-wrap: wrap;
   }
 
   .ci-installed-grid .ci-installed-card {

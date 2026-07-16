@@ -1,13 +1,14 @@
-import { faArrowUp, faExternalLink, faTrash } from '@fortawesome/free-solid-svg-icons';
+import { faArrowUp, faExternalLink, faSearch, faTrash } from '@fortawesome/free-solid-svg-icons';
 import { FontAwesomeIcon } from '@fortawesome/react-fontawesome';
 import { Loader } from '@mantine/core';
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useMemo, useState } from 'react';
 import { axiosInstance } from '@/api/axios.ts';
 import Alert from '@/elements/Alert.tsx';
 import Group from '@/elements/Group.tsx';
 import Text from '@/elements/Text.tsx';
 import Button from '@/elements/Button.tsx';
 import Card from '@/elements/Card.tsx';
+import TextInput from '@/elements/input/TextInput.tsx';
 import ConfirmationModal from '@/elements/modals/ConfirmationModal.tsx';
 import { useToast } from '@/providers/ToastProvider.tsx';
 import { useServerStore } from '@/stores/server.ts';
@@ -51,10 +52,12 @@ export default function ManageTab({ detection, contentType, installDir, refreshK
 
   const [loading, setLoading] = useState(true);
   const [items, setItems] = useState<IdentifiedContent[]>([]);
+  const [filter, setFilter] = useState('');
 
   // Action states
   const [removing, setRemoving] = useState<string | null>(null);
   const [updating, setUpdating] = useState<string | null>(null);
+  const [updatingAll, setUpdatingAll] = useState(false);
   const [confirmRemove, setConfirmRemove] = useState<IdentifiedContent | null>(null);
 
   const loaders = LOADER_TO_MODRINTH[detection.loader] ?? [];
@@ -223,6 +226,93 @@ export default function ManageTab({ detection, contentType, installDir, refreshK
     }
   }, [contentType, server.uuid, loadInstalled]);
 
+  // Client-side name filter — with hundreds of mods installed the list is
+  // unusable without one. Matches project title and filename.
+  const filteredItems = useMemo(() => {
+    const q = filter.trim().toLowerCase();
+    if (!q) return items;
+    return items.filter((i) =>
+      (i.project?.title ?? '').toLowerCase().includes(q) || i.file.name.toLowerCase().includes(q),
+    );
+  }, [items, filter]);
+
+  const updatableItems = useMemo(() => filteredItems.filter((i) => i.hasUpdate), [filteredItems]);
+  const currentItems = useMemo(() => filteredItems.filter((i) => !i.hasUpdate), [filteredItems]);
+
+  const doUpdateAll = useCallback(async () => {
+    setUpdatingAll(true);
+    try {
+      for (const item of updatableItems) {
+        await doUpdate(item);
+      }
+    } finally {
+      setUpdatingAll(false);
+    }
+  }, [updatableItems, doUpdate]);
+
+  const renderCard = (item: IdentifiedContent) => (
+    <Card key={item.file.name} p='sm' className='ci-installed-card'>
+      <div className='ci-installed-icon-wrap'>
+        {item.project?.icon_url ? (
+          <img src={item.project.icon_url} alt='' className='ci-project-icon' />
+        ) : (
+          <div className='ci-project-icon ci-project-icon--placeholder' />
+        )}
+      </div>
+      <div className='ci-installed-info'>
+        <Text fw={600} size='sm' lineClamp={1}>
+          {item.project?.title ?? item.file.name.replace('.jar', '')}
+        </Text>
+        <Text size='xs' c='dimmed'>
+          {item.file.name} &middot; {formatSize(item.file.size)}
+        </Text>
+        {item.version && (
+          <Text size='xs' c='dimmed'>v{item.version.version_number}</Text>
+        )}
+      </div>
+      <div className='ci-installed-actions'>
+        {item.hasUpdate && item.latestVersion && (
+          <Button
+            size='xs'
+            color='green'
+            variant='light'
+            loading={updating === item.file.name}
+            leftSection={<FontAwesomeIcon icon={faArrowUp} />}
+            onClick={() => doUpdate(item)}
+          >
+            Update
+          </Button>
+        )}
+        {item.project && (
+          <Button
+            size='xs'
+            variant='subtle'
+            leftSection={<FontAwesomeIcon icon={faExternalLink} />}
+            onClick={() => {
+      window.open(
+        `https://modrinth.com/${item.project!.project_type}/${item.project!.slug}`,
+        '_blank',
+        'noopener',
+      );
+            }}
+          >
+            Details
+          </Button>
+        )}
+        <Button
+          size='xs'
+          color='red'
+          variant='light'
+          loading={removing === item.file.name}
+          leftSection={<FontAwesomeIcon icon={faTrash} />}
+          onClick={() => setConfirmRemove(item)}
+        >
+          Remove
+        </Button>
+      </div>
+    </Card>
+  );
+
   const isRunning = state === 'running' || state === 'starting';
 
   return (
@@ -241,70 +331,52 @@ export default function ManageTab({ detection, contentType, installDir, refreshK
           Browse and install some from the Browse tab!
         </Text>
       ) : (
-        <div className='ci-installed-grid'>
-          {items.map((item) => (
-            <Card key={item.file.name} p='sm' className='ci-installed-card'>
-              <div className='ci-installed-icon-wrap'>
-                {item.project?.icon_url ? (
-                  <img src={item.project.icon_url} alt='' className='ci-project-icon' />
-                ) : (
-                  <div className='ci-project-icon ci-project-icon--placeholder' />
-                )}
-              </div>
-              <div className='ci-installed-info'>
-                <Text fw={600} size='sm' lineClamp={1}>
-                  {item.project?.title ?? item.file.name.replace('.jar', '')}
-                </Text>
-                <Text size='xs' c='dimmed'>
-                  {item.file.name} &middot; {formatSize(item.file.size)}
-                </Text>
-                {item.version && (
-                  <Text size='xs' c='dimmed'>v{item.version.version_number}</Text>
-                )}
-              </div>
-              <div className='ci-installed-actions'>
-                {item.hasUpdate && item.latestVersion && (
-                  <Button
-                    size='xs'
-                    color='green'
-                    variant='light'
-                    loading={updating === item.file.name}
-                    leftSection={<FontAwesomeIcon icon={faArrowUp} />}
-                    onClick={() => doUpdate(item)}
-                  >
-                    Update
-                  </Button>
-                )}
-                {item.project && (
-                  <Button
-                    size='xs'
-                    variant='subtle'
-                    leftSection={<FontAwesomeIcon icon={faExternalLink} />}
-                    onClick={() => {
-                      window.open(
-                        `https://modrinth.com/${item.project!.project_type}/${item.project!.slug}`,
-                        '_blank',
-                        'noopener',
-                      );
-                    }}
-                  >
-                    Details
-                  </Button>
-                )}
-                <Button
-                  size='xs'
-                  color='red'
-                  variant='light'
-                  loading={removing === item.file.name}
-                  leftSection={<FontAwesomeIcon icon={faTrash} />}
-                  onClick={() => setConfirmRemove(item)}
-                >
-                  Remove
-                </Button>
-              </div>
-            </Card>
-          ))}
-        </div>
+        <>
+          <div className='ci-installed-toolbar'>
+            <TextInput
+              placeholder={`Filter ${items.length} installed...`}
+              leftSection={<FontAwesomeIcon icon={faSearch} />}
+              value={filter}
+              onChange={(e) => setFilter(e.currentTarget.value)}
+              className='ci-installed-filter'
+              size='sm'
+            />
+            <Text size='xs' c='dimmed'>
+              {filteredItems.length !== items.length ? `${filteredItems.length} of ` : ''}{items.length} installed
+              {updatableItems.length > 0 && ` · ${updatableItems.length} update${updatableItems.length > 1 ? 's' : ''}`}
+            </Text>
+            {updatableItems.length > 1 && (
+              <Button
+                size='xs'
+                color='green'
+                variant='light'
+                loading={updatingAll}
+                leftSection={<FontAwesomeIcon icon={faArrowUp} />}
+                onClick={doUpdateAll}
+              >
+                Update all
+              </Button>
+            )}
+          </div>
+
+          {filteredItems.length === 0 && (
+            <Text c='dimmed' ta='center' mt='xl'>Nothing matches your filter.</Text>
+          )}
+
+          {updatableItems.length > 0 && (
+            <Text size='xs' c='dimmed' fw={600} tt='uppercase' mb={6} mt='xs'>Updates available</Text>
+          )}
+          <div className='ci-installed-grid'>
+          {updatableItems.map((item) => renderCard(item))}
+          </div>
+
+          {updatableItems.length > 0 && currentItems.length > 0 && (
+            <Text size='xs' c='dimmed' fw={600} tt='uppercase' mb={6} mt='md'>Up to date</Text>
+          )}
+          <div className='ci-installed-grid'>
+          {currentItems.map((item) => renderCard(item))}
+          </div>
+        </>
       )}
 
       {/* Confirm remove modal */}

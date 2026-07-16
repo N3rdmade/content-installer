@@ -261,6 +261,13 @@ export default function ModpacksTab({ detection }: ModpacksTabProps) {
     }));
   }, [selectedModpack?.source, modrinthVersions, cfFiles]);
 
+  // Size the version select to the longest option so the chosen value never
+  // truncates in the closed input (#18). ~7.1px/char at size sm + 60px chrome.
+  const versionSelectWidth = useMemo(() => {
+    const longest = versionOptions.reduce((m, o) => Math.max(m, o.label.length), 0);
+    return Math.min(Math.max(220, Math.round(longest * 7.1) + 60), 560);
+  }, [versionOptions]);
+
   const hasVersions = selectedModpack?.source === 'modrinth' ? modrinthVersions.length > 0 : cfFiles.length > 0;
 
   // Install
@@ -508,7 +515,7 @@ export default function ModpacksTab({ detection }: ModpacksTabProps) {
                     }}
                     searchable
                     size='sm'
-                    w='clamp(220px, 24vw, 420px)'
+                    w={`min(${versionSelectWidth}px, 100%)`}
                     comboboxProps={{ width: 'max-content', position: 'bottom-end' }}
                     disabled={installing}
                   />

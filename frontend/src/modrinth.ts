@@ -133,7 +133,11 @@ export async function searchProjects(opts: {
     facets.push(opts.gameVersions.map((v) => `versions:${v}`));
   }
   if (opts.categories && opts.categories.length > 0) {
-    facets.push(opts.categories.map((c) => `categories:${c}`));
+    // One facet group per category — groups are AND'd, so a project must match
+    // every selected category, not just one (#14).
+    for (const c of opts.categories) {
+      facets.push([`categories:${c}`]);
+    }
   }
   // Always filter for server-side support
   facets.push(['server_side:required', 'server_side:optional']);
@@ -256,4 +260,39 @@ export function timeAgo(dateStr: string): string {
   const months = Math.floor(days / 30);
   if (months < 12) return `${months}mo ago`;
   return `${Math.floor(months / 12)}y ago`;
+}
+
+// ─── Tag endpoints (filter options, #14) ─────────────────────
+
+export interface ModrinthCategoryTag {
+  name: string;
+  project_type: string;
+  header: string;
+}
+
+interface ModrinthGameVersionTag {
+  version: string;
+  version_type: string;
+}
+
+let categoriesCache: ModrinthCategoryTag[] | null = null;
+let gameVersionsCache: string[] | null = null;
+
+/** All category tags, cached for the session. */
+export async function getCategoryTags(): Promise<ModrinthCategoryTag[]> {
+  if (categoriesCache) return categoriesCache;
+  const res = await fetch(`${MODRINTH_BASE}/tag/category`, { headers: headers() });
+  if (!res.ok) return [];
+  categoriesCache = await res.json();
+  return categoriesCache ?? [];
+}
+
+/** Release game versions (newest first), cached for the session. */
+export async function getGameVersionTags(): Promise<string[]> {
+  if (gameVersionsCache) return gameVersionsCache;
+  const res = await fetch(`${MODRINTH_BASE}/tag/game_version`, { headers: headers() });
+  if (!res.ok) return [];
+  const tags: ModrinthGameVersionTag[] = await res.json();
+  gameVersionsCache = tags.filter((t) => t.version_type === 'release').map((t) => t.version);
+  return gameVersionsCache;
 }

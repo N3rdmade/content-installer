@@ -14,6 +14,7 @@ import Badge from '@/elements/Badge.tsx';
 import Button from '@/elements/Button.tsx';
 import Card from '@/elements/Card.tsx';
 import { Modal } from '@/elements/modals/Modal.tsx';
+import MultiSelect from '@/elements/input/MultiSelect.tsx';
 import Select from '@/elements/input/Select.tsx';
 import TextInput from '@/elements/input/TextInput.tsx';
 import { useToast } from '@/providers/ToastProvider.tsx';
@@ -37,11 +38,14 @@ import {
 import {
   formatDownloads,
   formatSize,
+  getCategoryTags,
+  getGameVersionTags,
   getProject,
   getPrimaryFile,
   getProjectVersions,
   searchProjects,
   timeAgo,
+  type ModrinthCategoryTag,
   type ModrinthProject,
   type ModrinthProjectDetails,
   type ModrinthVersion,
@@ -65,6 +69,7 @@ interface DisplayProject {
   downloads: number;
   author: string;
   iconUrl: string | null;
+  dateModified: string | null;
   source: Source;
   modrinthProject?: ModrinthProject;
   curseforgeProject?: CurseForgeProject;
@@ -84,6 +89,13 @@ export default function BrowseTab({ detection, contentType, installDir, onInstal
   const [totalHits, setTotalHits] = useState(0);
   const [loading, setLoading] = useState(false);
   const searchTimer = useRef<ReturnType<typeof setTimeout>>(null);
+
+  // User filters (#14). null = follow server detection; explicit value overrides it.
+  const [filterVersion, setFilterVersion] = useState<string | null>(detection.mcVersion);
+  const [filterLoader, setFilterLoader] = useState<string | null>(null);
+  const [filterCategories, setFilterCategories] = useState<string[]>([]);
+  const [versionOptionsList, setVersionOptionsList] = useState<string[]>([]);
+  const [categoryOptionsList, setCategoryOptionsList] = useState<ModrinthCategoryTag[]>([]);
 
   // Detail modal
   const [selectedProject, setSelectedProject] = useState<DisplayProject | null>(null);
@@ -114,7 +126,34 @@ export default function BrowseTab({ detection, contentType, installDir, onInstal
 
   useEffect(() => {
     checkCurseForgeStatus(server.uuid).then(setCfAvailable);
+    getGameVersionTags().then(setVersionOptionsList).catch(() => {});
+    getCategoryTags().then(setCategoryOptionsList).catch(() => {});
   }, [server.uuid]);
+
+  // Effective loader set: null = server default (smart compat expansion),
+  // 'any' = no loader filter, anything else = exactly that loader. Memoized —
+  // inline arrays here would change identity every render and loop the search effect.
+  const effectiveLoaders = useMemo(() => {
+    if (filterLoader === 'any') return [];
+    if (filterLoader) return [filterLoader];
+    return modrinthLoaders;
+  }, [filterLoader, modrinthLoaders]);
+
+  // Filter dropdown options (#14)
+  const loaderFilterOptions = useMemo(
+    () => (contentType === 'plugins'
+      ? ['paper', 'spigot', 'purpur', 'folia', 'bukkit']
+      : ['fabric', 'forge', 'neoforge', 'quilt']),
+    [contentType],
+  );
+  const categoryFilterOptions = useMemo(() => {
+    const projectType = contentType === 'datapacks' ? 'datapack' : contentType === 'plugins' ? 'plugin' : 'mod';
+    // Modrinth tags plugins/datapacks as project_type "mod" with loader distinctions,
+    // so fall back to mod categories when the exact type has none.
+    const exact = categoryOptionsList.filter((c) => c.project_type === projectType);
+    const pool = exact.length > 0 ? exact : categoryOptionsList.filter((c) => c.project_type === 'mod');
+    return [...new Set(pool.map((c) => c.name))].sort();
+  }, [categoryOptionsList, contentType]);
 
   // Modrinth search
   const doModrinthSearch = useCallback(async (q: string, sort: string, offset: number) => {
@@ -123,8 +162,9 @@ export default function BrowseTab({ detection, contentType, installDir, onInstal
     const res = await searchProjects({
       query: q || undefined,
       projectType,
-      loaders: modrinthLoaders.length > 0 ? modrinthLoaders : undefined,
-      gameVersions: detection.mcVersion ? [detection.mcVersion] : undefined,
+      loaders: effectiveLoaders.length > 0 ? effectiveLoaders : undefined,
+      gameVersions: filterVersion ? [filterVersion] : undefined,
+      categories: filterCategories.length > 0 ? filterCategories : undefined,
       index: sort as SearchIndex,
       offset,
       limit: 20,
@@ -136,22 +176,26 @@ export default function BrowseTab({ detection, contentType, installDir, onInstal
       downloads: p.downloads,
       author: p.author,
       iconUrl: p.icon_url,
+      dateModified: p.date_modified ?? null,
       source: 'modrinth' as const,
       modrinthProject: p,
     }));
     return { items, total: res.total_hits };
-  }, [contentType, modrinthLoaders, detection.mcVersion]);
+  }, [contentType, effectiveLoaders, filterVersion, filterCategories]);
 
   // CurseForge search
   const doCurseForgeSearch = useCallback(async (q: string, sort: string, offset: number) => {
     const sortMap: Record<string, number> = {
       relevance: 1, downloads: 6, follows: 2, newest: 11, updated: 3,
     };
+    // CF only understands the big four loaders; explicit filter wins over detection.
+    const cfLoaderMap: Record<string, number> = { forge: 1, fabric: 4, quilt: 5, neoforge: 6 };
+    const effCfLoader = filterLoader ? (cfLoaderMap[filterLoader] ?? 0) : cfModLoaderType;
     const res = await searchCurseForge(server.uuid, {
       searchFilter: q || undefined,
       classId: cfClassId,
-      gameVersion: detection.mcVersion ?? undefined,
-      modLoaderType: cfModLoaderType > 0 ? cfModLoaderType : undefined,
+      gameVersion: filterVersion ?? undefined,
+      modLoaderType: effCfLoader > 0 ? effCfLoader : undefined,
       sortField: sortMap[sort] ?? 1,
       sortOrder: 'desc',
       index: offset,
@@ -164,11 +208,12 @@ export default function BrowseTab({ detection, contentType, installDir, onInstal
       downloads: p.downloadCount,
       author: p.authors[0]?.name ?? 'Unknown',
       iconUrl: p.logo?.thumbnailUrl ?? null,
+      dateModified: p.dateModified ?? null,
       source: 'curseforge' as const,
       curseforgeProject: p,
     }));
     return { items, total: res.pagination.totalCount };
-  }, [server.uuid, cfClassId, detection.mcVersion, cfModLoaderType]);
+  }, [server.uuid, cfClassId, filterVersion, filterLoader, cfModLoaderType]);
 
   const doSearch = useCallback(async (q: string, sort: string, offset: number) => {
     setLoading(true);
@@ -355,6 +400,13 @@ export default function BrowseTab({ detection, contentType, installDir, onInstal
     }));
   }, [selectedProject?.source, modrinthVersions, cfFiles]);
 
+  // Size the version select to the longest option so the chosen value never
+  // truncates in the closed input (#18). ~7.1px/char at size sm + 60px chrome.
+  const versionSelectWidth = useMemo(() => {
+    const longest = versionOptions.reduce((m, o) => Math.max(m, o.label.length), 0);
+    return Math.min(Math.max(220, Math.round(longest * 7.1) + 60), 560);
+  }, [versionOptions]);
+
   const hasVersions = selectedProject?.source === 'modrinth' ? modrinthVersions.length > 0 : cfFiles.length > 0;
   const hasSelection = selectedProject?.source === 'modrinth' ? !!selectedModrinthVersion : !!selectedCfFile;
 
@@ -421,18 +473,50 @@ export default function BrowseTab({ detection, contentType, installDir, onInstal
         />
       </div>
 
-      {/* Detection info */}
-      {(detection.loader !== 'unknown' || detection.mcVersion) && (
-        <Group gap='xs' mt='xs' mb='sm'>
-          {detection.loader !== 'unknown' && (
-            <Badge variant='light' color='violet' size='sm'>{detection.loader}</Badge>
-          )}
-          {detection.mcVersion && (
-            <Badge variant='light' color='gray' size='sm'>{detection.mcVersion}</Badge>
-          )}
-          <Text size='xs' c='dimmed'>Results filtered for your server</Text>
-        </Group>
-      )}
+      {/* Filters (#14) — all applied together. Defaults follow server detection. */}
+      <div className='ci-filter-bar'>
+        {contentType !== 'datapacks' && (
+          <Select
+            placeholder='Server default'
+            data={[
+              { value: 'any', label: 'Any type' },
+              ...loaderFilterOptions.map((l) => ({ value: l, label: l })),
+            ]}
+            value={filterLoader}
+            onChange={setFilterLoader}
+            clearable
+            size='xs'
+            w={150}
+          />
+        )}
+        <Select
+          placeholder='Any version'
+          data={versionOptionsList}
+          value={filterVersion}
+          onChange={setFilterVersion}
+          clearable
+          searchable
+          size='xs'
+          w={130}
+        />
+        {source === 'modrinth' && (
+          <MultiSelect
+            placeholder={filterCategories.length === 0 ? 'Categories' : undefined}
+            data={categoryFilterOptions}
+            value={filterCategories}
+            onChange={setFilterCategories}
+            clearable
+            searchable
+            size='xs'
+            w={260}
+          />
+        )}
+        <Text size='xs' c='dimmed'>
+          {filterLoader === null && (detection.loader !== 'unknown' || detection.mcVersion)
+            ? 'Filtered for your server'
+            : ''}
+        </Text>
+      </div>
 
       {/* Card grid */}
       {loading && results.length === 0 ? (
@@ -469,6 +553,7 @@ export default function BrowseTab({ detection, contentType, installDir, onInstal
                 <div className='ci-card-footer'>
                   <Text size='xs' c='dimmed'>
                     {(project.source === 'curseforge' ? cfFormatDownloads : formatDownloads)(project.downloads)} downloads
+                    {project.dateModified && ` · updated ${timeAgo(project.dateModified)}`}
                   </Text>
                   <Badge variant='light' color={project.source === 'curseforge' ? 'orange' : 'green'} size='xs'>
                     {project.source === 'curseforge' ? 'CurseForge' : 'Modrinth'}
@@ -585,7 +670,7 @@ export default function BrowseTab({ detection, contentType, installDir, onInstal
                       }}
                       searchable
                       size='sm'
-                      w='clamp(220px, 24vw, 420px)'
+                      w={`min(${versionSelectWidth}px, 100%)`}
                       comboboxProps={{ width: 'max-content', position: 'bottom-end' }}
                     />
                     {installState === 'done' ? (
