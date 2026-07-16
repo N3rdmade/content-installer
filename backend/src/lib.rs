@@ -14,6 +14,44 @@ use shared::{
     State,
 };
 use std::sync::Arc;
+use wings_api::client::AsyncRequestReader;
+
+// ── wings-api 1.1.0 request helpers ──
+// Panel 1.1.0 moved file path / options off positional args into typed Query
+// structs, and file writes now take a streamed body. These wrappers keep the
+// call sites terse.
+#[inline]
+fn q_list(dir: &str) -> wings_api::servers_server_files_list_directory::get::Query {
+    wings_api::servers_server_files_list_directory::get::Query {
+        directory: Some(dir.into()),
+        ..Default::default()
+    }
+}
+#[inline]
+fn q_contents(
+    file: &str,
+    download: bool,
+    max_size: u64,
+) -> wings_api::servers_server_files_contents::get::Query {
+    wings_api::servers_server_files_contents::get::Query {
+        file: Some(file.into()),
+        download: Some(download),
+        max_size: Some(max_size),
+        ..Default::default()
+    }
+}
+#[inline]
+fn q_write(file: &str, user: uuid::Uuid) -> wings_api::servers_server_files_write::post::Query {
+    wings_api::servers_server_files_write::post::Query {
+        file: Some(file.into()),
+        user: Some(user),
+        ..Default::default()
+    }
+}
+#[inline]
+fn body_bytes(data: impl Into<Vec<u8>>) -> AsyncRequestReader {
+    AsyncRequestReader::new(std::io::Cursor::new(data.into()))
+}
 
 #[derive(Default)]
 pub struct ExtensionStruct;
@@ -509,7 +547,7 @@ async fn run_modpack_install(
     if params.clean_install {
         update_progress("preparing", 0, 0, "Wiping server files...").await;
         let entries = wings
-            .get_servers_server_files_list_directory(server_uuid, "/")
+            .get_servers_server_files_list_directory(server_uuid, &q_list("/"))
             .await
             .map_err(|e| format!("Failed to list files: {e:?}"))?;
 
@@ -572,9 +610,7 @@ async fn run_modpack_install(
     let mut index_data = wings
         .get_servers_server_files_contents(
             server_uuid,
-            "/_mrpack_temp/modrinth.index.json",
-            false,
-            10_000_000, // 10MB max
+            &q_contents("/_mrpack_temp/modrinth.index.json", false, 10_000_000), // 10MB max
         )
         .await
         .map_err(|e| format!("Failed to read modrinth.index.json: {e:?}"))?;
@@ -593,7 +629,7 @@ async fn run_modpack_install(
 
     // Move overrides/ contents to root
     let override_entries = wings
-        .get_servers_server_files_list_directory(server_uuid, "/_mrpack_temp/overrides")
+        .get_servers_server_files_list_directory(server_uuid, &q_list("/_mrpack_temp/overrides"))
         .await
         .unwrap_or_default();
 
@@ -616,7 +652,7 @@ async fn run_modpack_install(
 
     // Move server-overrides/ contents to root (layered on top)
     let server_override_entries = wings
-        .get_servers_server_files_list_directory(server_uuid, "/_mrpack_temp/server-overrides")
+        .get_servers_server_files_list_directory(server_uuid, &q_list("/_mrpack_temp/server-overrides"))
         .await
         .unwrap_or_default();
 
@@ -859,7 +895,7 @@ async fn run_modpack_install(
     update_progress("installing_loader", total, total, "Scanning for client-only mods...").await;
 
     let mods_entries = wings
-        .get_servers_server_files_list_directory(server_uuid, "/mods")
+        .get_servers_server_files_list_directory(server_uuid, &q_list("/mods"))
         .await
         .unwrap_or_default();
 
@@ -876,7 +912,7 @@ async fn run_modpack_install(
 
         // Read the jar to inspect metadata and hash it
         if let Ok(mut file_data) = wings
-            .get_servers_server_files_contents(server_uuid, &format!("/mods/{}", entry.name), true, 50_000_000)
+            .get_servers_server_files_contents(server_uuid, &q_contents(&format!("/mods/{}", entry.name), true, 50_000_000))
             .await
         {
             let mut bytes = Vec::new();
@@ -945,9 +981,8 @@ async fn run_modpack_install(
     let _ = wings
         .post_servers_server_files_write(
             server_uuid,
-            "/eula.txt",
-            user_uuid,
-            "eula=true\n".into(),
+            body_bytes("eula=true\n".to_string()),
+            &q_write("/eula.txt", user_uuid),
         )
         .await;
 
@@ -967,9 +1002,8 @@ async fn run_modpack_install(
         let _ = wings
             .post_servers_server_files_write(
                 server_uuid,
-                "/.mcvc-type.json",
-                user_uuid,
-                serde_json::to_string(&marker).unwrap_or_default().into(),
+                body_bytes(serde_json::to_string(&marker).unwrap_or_default()),
+                &q_write("/.mcvc-type.json", user_uuid),
             )
             .await;
     }
@@ -1107,7 +1141,7 @@ async fn run_cf_modpack_install(
     if params.clean_install {
         update_progress("preparing", 0, 0, "Wiping server files...").await;
         let entries = wings
-            .get_servers_server_files_list_directory(server_uuid, "/")
+            .get_servers_server_files_list_directory(server_uuid, &q_list("/"))
             .await
             .map_err(|e| format!("Failed to list files: {e:?}"))?;
         let files: Vec<compact_str::CompactString> = entries.iter().map(|e| e.name.clone()).collect();
@@ -1169,9 +1203,7 @@ async fn run_cf_modpack_install(
     let mut manifest_data = wings
         .get_servers_server_files_contents(
             server_uuid,
-            "/_cf_temp/manifest.json",
-            false,
-            10_000_000,
+            &q_contents("/_cf_temp/manifest.json", false, 10_000_000),
         )
         .await
         .map_err(|e| format!("Failed to read manifest.json: {e:?}"))?;
@@ -1188,7 +1220,7 @@ async fn run_cf_modpack_install(
     update_progress("applying_overrides", 0, 0, "Applying config overrides...").await;
     let overrides_path = format!("/_cf_temp/{}", manifest.overrides);
     let override_entries = wings
-        .get_servers_server_files_list_directory(server_uuid, &overrides_path)
+        .get_servers_server_files_list_directory(server_uuid, &q_list(&overrides_path))
         .await
         .unwrap_or_default();
 
@@ -1397,7 +1429,7 @@ async fn run_cf_modpack_install(
     update_progress("installing_loader", downloaded, total, "Scanning for client-only mods...").await;
 
     let mods_entries = wings
-        .get_servers_server_files_list_directory(server_uuid, "/mods")
+        .get_servers_server_files_list_directory(server_uuid, &q_list("/mods"))
         .await
         .unwrap_or_default();
 
@@ -1412,7 +1444,7 @@ async fn run_cf_modpack_install(
         }
 
         if let Ok(mut file_data) = wings
-            .get_servers_server_files_contents(server_uuid, &format!("/mods/{}", entry.name), true, 50_000_000)
+            .get_servers_server_files_contents(server_uuid, &q_contents(&format!("/mods/{}", entry.name), true, 50_000_000))
             .await
         {
             let mut bytes = Vec::new();
@@ -1440,7 +1472,7 @@ async fn run_cf_modpack_install(
 
     // Step 9: Write eula.txt
     let _ = wings
-        .post_servers_server_files_write(server_uuid, "/eula.txt", user_uuid, "eula=true\n".into())
+        .post_servers_server_files_write(server_uuid, body_bytes("eula=true\n".to_string()), &q_write("/eula.txt", user_uuid))
         .await;
 
     // Step 10: Write .mcvc-type.json marker
@@ -1455,9 +1487,8 @@ async fn run_cf_modpack_install(
         let _ = wings
             .post_servers_server_files_write(
                 server_uuid,
-                "/.mcvc-type.json",
-                user_uuid,
-                serde_json::to_string(&marker).unwrap_or_default().into(),
+                body_bytes(serde_json::to_string(&marker).unwrap_or_default()),
+                &q_write("/.mcvc-type.json", user_uuid),
             )
             .await;
     }
