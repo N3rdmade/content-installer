@@ -179,6 +179,11 @@
   max-height: 60vh;
   overflow-y: auto;
   margin-bottom: 16px;
+  /* Modrinth caps its description column at 874px; narrower screens scale naturally (#15) */
+  max-width: 874px;
+  margin-left: auto;
+  margin-right: auto;
+  width: 100%;
   font-size: 0.85rem;
   line-height: 1.6;
   color: var(--mantine-color-dimmed);
@@ -252,8 +257,12 @@
   gap: 6px;
 }
 
-.ci-installed-card {
+/* Mantine Card root is display:flex + flex-direction:column (for Card.Section).
+   Direction must be forced back to row, and the selector needs two classes so it
+   out-ranks Mantine's own single-class rule regardless of stylesheet order. */
+.ci-installed-grid .ci-installed-card {
   display: flex;
+  flex-direction: row;
   align-items: center;
   gap: 12px;
 }
@@ -300,7 +309,7 @@
     align-items: stretch;
   }
 
-  .ci-installed-card {
+  .ci-installed-grid .ci-installed-card {
     flex-direction: column;
     align-items: flex-start;
     gap: 8px;

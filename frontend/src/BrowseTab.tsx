@@ -585,7 +585,8 @@ export default function BrowseTab({ detection, contentType, installDir, onInstal
                       }}
                       searchable
                       size='sm'
-                      w={220}
+                      w='clamp(220px, 24vw, 420px)'
+                      comboboxProps={{ width: 'max-content', position: 'bottom-end' }}
                     />
                     {installState === 'done' ? (
                       <Button
@@ -655,5 +656,7 @@ export default function BrowseTab({ detection, contentType, installDir, onInstal
 }
 
 function convertMarkdown(md: string): string {
-  return marked.parse(md, { async: false, breaks: true }) as string;
+  // breaks:false (GFM default) — Modrinth treats single newlines as spaces, so
+  // breaks:true exploded "link | link | link" header rows into one link per line (#15).
+  return marked.parse(md, { async: false, breaks: false, gfm: true }) as string;
 }

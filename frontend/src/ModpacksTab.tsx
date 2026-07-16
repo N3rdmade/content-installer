@@ -508,7 +508,8 @@ export default function ModpacksTab({ detection }: ModpacksTabProps) {
                     }}
                     searchable
                     size='sm'
-                    w={220}
+                    w='clamp(220px, 24vw, 420px)'
+                    comboboxProps={{ width: 'max-content', position: 'bottom-end' }}
                     disabled={installing}
                   />
                 )}
@@ -536,7 +537,7 @@ export default function ModpacksTab({ detection }: ModpacksTabProps) {
                 dangerouslySetInnerHTML={{
                   __html: selectedModpack.source === 'curseforge'
                     ? detailBody
-                    : (marked.parse(detailBody, { async: false, breaks: true }) as string),
+                    : (marked.parse(detailBody, { async: false, breaks: false, gfm: true }) as string),
                 }}
               />
             ) : (

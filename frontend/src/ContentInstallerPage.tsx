@@ -6,7 +6,6 @@ import Group from '@/elements/Group.tsx';
 import SegmentedControl from '@/elements/SegmentedControl.tsx';
 import Text from '@/elements/Text.tsx';
 import Title from '@/elements/Title.tsx';
-import Badge from '@/elements/Badge.tsx';
 import Select from '@/elements/input/Select.tsx';
 import { useEffect, useState } from 'react';
 import ServerContentContainer from '@/elements/containers/ServerContentContainer.tsx';
@@ -75,18 +74,6 @@ export default function ContentInstallerPage() {
           <Title order={3}>
             {mainTab === 'modpacks' ? 'Modpacks' : TAB_LABELS[contentTab]}
           </Title>
-          <Group gap='sm'>
-            {detection?.loader && detection.loader !== 'unknown' && (
-              <Badge variant='light' color='violet' size='sm'>
-                {detection.loader}
-              </Badge>
-            )}
-            {detection?.mcVersion && (
-              <Badge variant='light' color='gray' size='sm'>
-                {detection.mcVersion}
-              </Badge>
-            )}
-          </Group>
         </div>
 
         {detecting ? (
