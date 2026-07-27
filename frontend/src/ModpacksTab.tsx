@@ -19,6 +19,7 @@ import TextInput from '@/elements/input/TextInput.tsx';
 import { useToast } from '@/providers/ToastProvider.tsx';
 import { useServerStore } from '@/stores/server.ts';
 import type { ServerDetection } from './detect.ts';
+import { versionLabel } from './versions.ts';
 import {
   CF_CLASS_MODPACKS,
   checkCurseForgeStatus,
@@ -252,12 +253,12 @@ export default function ModpacksTab({ detection }: ModpacksTabProps) {
     if (selectedModpack?.source === 'modrinth') {
       return modrinthVersions.map((v) => ({
         value: v.id,
-        label: `${v.version_number} (${v.game_versions.slice(0, 3).join(', ')}${v.game_versions.length > 3 ? '...' : ''})`,
+        label: versionLabel(v.version_number, v.game_versions),
       }));
     }
     return cfFiles.map((f) => ({
       value: String(f.id),
-      label: `${f.displayName} (${f.gameVersions.filter((v) => /^\d/.test(v)).slice(0, 3).join(', ')})`,
+      label: versionLabel(f.displayName, f.gameVersions),
     }));
   }, [selectedModpack?.source, modrinthVersions, cfFiles]);
 
