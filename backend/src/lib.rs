@@ -179,7 +179,9 @@ async fn admin_get_settings(
     // CurseForge keys are bcrypt-shaped (`$2a$10$...`). Anything that routes the key
     // through an unquoted shell, .env or compose file eats `$2a` and `$10` as variable
     // expansions and stores a silently truncated key, which CurseForge then rejects (#22).
-    let malformed = !ext.curseforge_api_key.is_empty() && !ext.curseforge_api_key.starts_with("$2a$");
+    let malformed = !ext.curseforge_api_key.is_empty()
+        && (!ext.curseforge_api_key.starts_with("$2a$")
+            || ext.curseforge_api_key.chars().any(|c| c.is_whitespace() || c.is_control()));
     Ok(axum::Json(serde_json::json!({
         "curseforge_configured": !ext.curseforge_api_key.is_empty(),
         "curseforge_api_key_masked": masked,
@@ -206,7 +208,11 @@ async fn admin_put_settings(
         .map_err(|_| err(StatusCode::INTERNAL_SERVER_ERROR, "Settings not found"))?;
 
     if let Some(key) = body.curseforge_api_key {
-        ext.curseforge_api_key = key.into();
+        // Trim before storing. A key pasted with a trailing newline is not a legal header
+        // value, so reqwest fails at build time and the user gets "CurseForge request
+        // failed: builder error" — which says nothing about the real problem (#22).
+        // Surrounding spaces are harmless (headers strip OWS) but there is no reason to keep them.
+        ext.curseforge_api_key = key.trim().into();
     }
 
     settings
