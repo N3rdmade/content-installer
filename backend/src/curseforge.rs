@@ -26,20 +26,125 @@ async fn get_api_key(state: &GetState) -> Result<String, (StatusCode, String)> {
     Ok(ext.curseforge_api_key.to_string())
 }
 
+/// One client for every CurseForge call. The old per-request `Client::new()` paid a full
+/// TLS handshake each time and defeated connection pooling — from CurseForge's side that
+/// looks burstier than the same traffic pooled. The panel's core clients all set a
+/// User-Agent; this one now does too (reqwest sends none by default, which is both rude
+/// and the kind of thing CDN bot rules key on).
+fn http_client() -> &'static reqwest::Client {
+    static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+    CLIENT.get_or_init(|| {
+        reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(30))
+            .user_agent(concat!(
+                "gg.ir77.contentinstaller/",
+                env!("CARGO_PKG_VERSION"),
+                " (github.com/Regrave/content-installer)"
+            ))
+            .build()
+            .expect("static client config cannot fail")
+    })
+}
+
+/// How long a cached body is served without asking CurseForge again.
+pub const TTL_SEARCH: std::time::Duration = std::time::Duration::from_secs(60);
+pub const TTL_FILES: std::time::Duration = std::time::Duration::from_secs(60);
+pub const TTL_DESCRIPTION: std::time::Duration = std::time::Duration::from_secs(3600);
+pub const TTL_CATEGORIES: std::time::Duration = std::time::Duration::from_secs(6 * 3600);
+
+/// Everything here is public mod metadata keyed by full URL, so one panel-wide map is
+/// safe. Entries are kept past their TTL on purpose: when CurseForge is down (2026-07-27:
+/// valid keys 403ing, /categories 504ing for hours) a stale listing beats an error page.
+/// Capped by evicting the oldest insert; at ~90 KB per search page that bounds worst-case
+/// memory around 12 MB.
+const CACHE_MAX_ENTRIES: usize = 128;
+
+fn cache() -> &'static std::sync::Mutex<std::collections::HashMap<String, (std::time::Instant, String)>> {
+    static CACHE: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<String, (std::time::Instant, String)>>,
+    > = std::sync::OnceLock::new();
+    CACHE.get_or_init(Default::default)
+}
+
+fn cache_get(url: &str, max_age: Option<std::time::Duration>) -> Option<String> {
+    let map = cache().lock().ok()?;
+    let (inserted, body) = map.get(url)?;
+    match max_age {
+        Some(ttl) if inserted.elapsed() > ttl => None,
+        _ => Some(body.clone()),
+    }
+}
+
+fn cache_put(url: &str, body: &str) {
+    let Ok(mut map) = cache().lock() else { return };
+    if map.len() >= CACHE_MAX_ENTRIES && !map.contains_key(url) {
+        if let Some(oldest) = map
+            .iter()
+            .min_by_key(|(_, (t, _))| *t)
+            .map(|(k, _)| k.clone())
+        {
+            map.remove(&oldest);
+        }
+    }
+    map.insert(url.to_string(), (std::time::Instant::now(), body.to_string()));
+}
+
 /// Authenticated GET against the CurseForge API, returning the raw response body.
+///
+/// Serves from cache within `ttl`; on any upstream failure falls back to a stale cached
+/// body when one exists, so a CurseForge incident degrades to slightly-old data instead
+/// of an error page. A 429 with a short Retry-After is retried once before giving up.
 ///
 /// Upstream 401/403 means the configured key is wrong — a user-fixable setting, not a
 /// gateway failure — so it does not collapse into a 502 the way it used to (#22). 502 is
 /// kept for genuine transport errors so "bad gateway" still means "could not reach CurseForge".
-async fn cf_get(url: &str, api_key: &str) -> Result<String, (StatusCode, String)> {
-    let client = reqwest::Client::new();
-    let resp = client
+async fn cf_get(
+    url: &str,
+    api_key: &str,
+    ttl: std::time::Duration,
+) -> Result<String, (StatusCode, String)> {
+    if let Some(fresh) = cache_get(url, Some(ttl)) {
+        return Ok(fresh);
+    }
+    match cf_fetch(url, api_key).await {
+        Ok(body) => {
+            cache_put(url, &body);
+            Ok(body)
+        }
+        // Stale beats broken for public listings. The error still surfaces on queries that
+        // were never cached, so a genuinely bad key does not stay hidden for long.
+        Err(e) => cache_get(url, None).ok_or(e),
+    }
+}
+
+async fn cf_fetch(url: &str, api_key: &str) -> Result<String, (StatusCode, String)> {
+    let mut resp = http_client()
         .get(url)
         .header("x-api-key", api_key)
         .header("Accept", "application/json")
         .send()
         .await
         .map_err(|e| err(StatusCode::BAD_GATEWAY, format!("CurseForge request failed: {e}")))?;
+
+    // One polite retry when rate limited and the advertised wait is short. Capped at 3s —
+    // the user is holding an open HTTP request, not running a batch job.
+    if resp.status() == StatusCode::TOO_MANY_REQUESTS {
+        let wait = resp
+            .headers()
+            .get(reqwest::header::RETRY_AFTER)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(1)
+            .min(3);
+        tokio::time::sleep(std::time::Duration::from_secs(wait)).await;
+        resp = http_client()
+            .get(url)
+            .header("x-api-key", api_key)
+            .header("Accept", "application/json")
+            .send()
+            .await
+            .map_err(|e| err(StatusCode::BAD_GATEWAY, format!("CurseForge request failed: {e}")))?;
+    }
 
     let status = resp.status();
     // Who actually answered. CurseForge's own API is served by Kestrel; anything else on a
@@ -81,23 +186,26 @@ async fn cf_get(url: &str, api_key: &str) -> Result<String, (StatusCode, String)
                  Upstream said: {body}"
             ),
         ),
-        // Not Kestrel, so CurseForge never saw this request — a proxy or CDN edge answered
-        // for them. Every genuine CurseForge rejection carries the 37-byte body
-        // `Forbidden: API Key missing or invalid`; an empty one never comes from them.
-        // Re-pasting the key cannot fix this, so do not send the user chasing it.
+        // Not Kestrel, so CurseForge's application never evaluated the key. Either their own
+        // edge (CloudFront / awselb) answered during an incident, or something local — a
+        // proxy env var, egress filtering — intercepted the request. Both are possible and
+        // the wording must not pick one: during the 2026-07-27 outage their edge produced
+        // exactly this shape, and "check your proxy" would have been wrong advice.
         StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => err(
             StatusCode::BAD_GATEWAY,
             format!(
-                "Blocked before reaching CurseForge: {status} from `{via}`, not CurseForge \
-                 (their API always answers as `Kestrel`). Something between this panel and \
-                 api.curseforge.com refused the request — check HTTP_PROXY/HTTPS_PROXY/ALL_PROXY \
-                 in the panel's environment, and any egress filtering. This is not an API key \
-                 problem. Upstream said: {body}"
+                "{status} from `{via}` — CurseForge's application never evaluated the key \
+                 (their API answers as `Kestrel`). Either CurseForge's edge is having an \
+                 incident (wait and retry), or something between this panel and \
+                 api.curseforge.com intercepted the request (check \
+                 HTTP_PROXY/HTTPS_PROXY/ALL_PROXY in the panel's environment and any egress \
+                 filtering). Not an API key problem. Upstream said: {body}"
             ),
         ),
         StatusCode::TOO_MANY_REQUESTS => err(
             StatusCode::TOO_MANY_REQUESTS,
-            "CurseForge rate limit reached. Try again in a moment.".to_string(),
+            "CurseForge rate limit reached (retried once already). Try again in a moment."
+                .to_string(),
         ),
         // Their load balancer and CDN answer as `awselb/2.0` / `CloudFront`. A 5xx from those is
         // CurseForge's own infrastructure failing, never anything the panel operator can fix.
@@ -184,7 +292,7 @@ pub async fn search(
     url.push_str(&format!("&index={}", params.index.unwrap_or(0)));
     url.push_str(&format!("&pageSize={}", params.page_size.unwrap_or(20)));
 
-    let body = cf_get(&url, &api_key).await?;
+    let body = cf_get(&url, &api_key, TTL_SEARCH).await?;
 
     Ok((
         StatusCode::OK,
@@ -214,7 +322,7 @@ pub async fn categories(
         url.push_str(&format!("&classId={cid}"));
     }
 
-    let body = cf_get(&url, &api_key).await?;
+    let body = cf_get(&url, &api_key, TTL_CATEGORIES).await?;
 
     Ok((
         StatusCode::OK,
@@ -256,7 +364,7 @@ pub async fn files(
     url.push_str(&format!("index={}", params.index.unwrap_or(0)));
     url.push_str(&format!("&pageSize={}", params.page_size.unwrap_or(20)));
 
-    let body = cf_get(&url, &api_key).await?;
+    let body = cf_get(&url, &api_key, TTL_FILES).await?;
 
     Ok((
         StatusCode::OK,
@@ -283,7 +391,7 @@ pub async fn description(
 
     let url = format!("{CF_BASE}/v1/mods/{}/description", params.mod_id);
 
-    let body = cf_get(&url, &api_key).await?;
+    let body = cf_get(&url, &api_key, TTL_DESCRIPTION).await?;
 
     Ok((
         StatusCode::OK,
