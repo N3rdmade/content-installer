@@ -77,6 +77,33 @@ export type CurseForgeSortField = 1 | 2 | 3 | 4 | 5 | 6;
 
 // ---- API Functions (proxied through panel backend) ----
 
+/**
+ * Build an error message that keeps what the backend actually said.
+ *
+ * The backend distinguishes a rejected API key, a rate limit and a genuine transport
+ * failure, but throwing only `res.status` discarded all of it and left users staring at
+ * a bare "503" with no way to act on it (#22). The panel error envelope is
+ * `{"errors": [...]}`; extension routes return a plain string, so handle both.
+ */
+async function cfError(res: Response, what: string): Promise<string> {
+  let detail = '';
+  try {
+    const raw = await res.text();
+    try {
+      const parsed = JSON.parse(raw);
+      detail = Array.isArray(parsed?.errors) ? parsed.errors.join('; ') : raw;
+    } catch {
+      detail = raw;
+    }
+  } catch {
+    // body already consumed or unreadable — fall through to the bare status
+  }
+  detail = detail.trim();
+  return detail
+    ? `CurseForge ${what} failed (${res.status}): ${detail}`
+    : `CurseForge ${what} failed: ${res.status}`;
+}
+
 export async function searchCurseForge(serverUuid: string, opts: {
   searchFilter?: string;
   classId?: number;
@@ -105,7 +132,7 @@ export async function searchCurseForge(serverUuid: string, opts: {
   params.set('pageSize', String(opts.pageSize ?? 20));
 
   const res = await fetch(`${baseUrl}/search?${params}`);
-  if (!res.ok) throw new Error(`CurseForge search failed: ${res.status}`);
+  if (!res.ok) throw new Error(await cfError(res, 'search'));
   return res.json();
 }
 
@@ -127,7 +154,7 @@ export async function getCurseForgeFiles(serverUuid: string, opts: {
   params.set('pageSize', String(opts.pageSize ?? 20));
 
   const res = await fetch(`${baseUrl}/files?${params}`);
-  if (!res.ok) throw new Error(`CurseForge files failed: ${res.status}`);
+  if (!res.ok) throw new Error(await cfError(res, 'files'));
   return res.json();
 }
 
@@ -144,7 +171,7 @@ export async function getCurseForgeCategories(serverUuid: string, classId: numbe
   const baseUrl = `/api/client/servers/${serverUuid}/content-installer/curseforge`;
   const params = new URLSearchParams({ classId: String(classId) });
   const res = await fetch(`${baseUrl}/categories?${params}`);
-  if (!res.ok) throw new Error(`CurseForge categories failed: ${res.status}`);
+  if (!res.ok) throw new Error(await cfError(res, 'categories'));
   const data = await res.json();
   return data.data ?? [];
 }
