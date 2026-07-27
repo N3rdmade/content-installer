@@ -65,12 +65,20 @@ async fn cf_get(url: &str, api_key: &str) -> Result<String, (StatusCode, String)
         // intermediary proxy can produce one too, and only the body tells them apart —
         // CurseForge answers `Forbidden: API Key missing or invalid` in plain text.
         // Dropping it for a canned message cost a full round-trip with a reporter (#22).
+        // Observed 2026-07-27: during a CurseForge incident this exact 403 came back for a key
+        // that had worked minutes earlier and was never changed, while /categories and /games
+        // returned 504 from their load balancer. CurseForge reuses this one message for a bad
+        // key, for rate limiting, and for their own outages, so it cannot be reported as a key
+        // problem — telling users to re-paste a valid key sends them in circles (#22).
         StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN if via == "Kestrel" => err(
             StatusCode::SERVICE_UNAVAILABLE,
             format!(
-                "CurseForge rejected the API key ({status}). Check it under \
-                 Admin -> Content Installer: keys are exactly 60 characters and start with \
-                 `$2a$`. Upstream said: {body}"
+                "CurseForge refused the request ({status}). They send this same message for an \
+                 invalid key, for rate limiting, and during their own outages. If browsing \
+                 worked recently and the key has not changed, it is very likely their end — \
+                 wait and retry before changing anything. Otherwise check the key under \
+                 Admin -> Content Installer: exactly 60 characters, starting `$2a$`. \
+                 Upstream said: {body}"
             ),
         ),
         // Not Kestrel, so CurseForge never saw this request — a proxy or CDN edge answered
@@ -91,9 +99,18 @@ async fn cf_get(url: &str, api_key: &str) -> Result<String, (StatusCode, String)
             StatusCode::TOO_MANY_REQUESTS,
             "CurseForge rate limit reached. Try again in a moment.".to_string(),
         ),
+        // Their load balancer and CDN answer as `awselb/2.0` / `CloudFront`. A 5xx from those is
+        // CurseForge's own infrastructure failing, never anything the panel operator can fix.
+        _ if status.is_server_error() => err(
+            StatusCode::BAD_GATEWAY,
+            format!(
+                "CurseForge is having problems: {status} from `{via}`. This is an outage on \
+                 their side, not a panel or API key issue. Try again later."
+            ),
+        ),
         _ => err(
             StatusCode::BAD_GATEWAY,
-            format!("CurseForge returned {status}: {body}"),
+            format!("CurseForge returned {status} (via `{via}`): {body}"),
         ),
     })
 }
