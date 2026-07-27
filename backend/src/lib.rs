@@ -16,6 +16,9 @@ use shared::{
 use std::sync::Arc;
 use wings_api::client::AsyncRequestReader;
 
+/// CurseForge API keys are bcrypt hashes and always this long.
+const CF_API_KEY_LEN: usize = 60;
+
 // ── wings-api 1.1.0 request helpers ──
 // Panel 1.1.0 moved file path / options off positional args into typed Query
 // structs, and file writes now take a streamed body. These wrappers keep the
@@ -176,16 +179,22 @@ async fn admin_get_settings(
             "*".repeat(key.len())
         }
     };
-    // CurseForge keys are bcrypt-shaped (`$2a$10$...`). Anything that routes the key
-    // through an unquoted shell, .env or compose file eats `$2a` and `$10` as variable
-    // expansions and stores a silently truncated key, which CurseForge then rejects (#22).
+    // CurseForge keys are bcrypt strings: exactly 60 chars, `$2a$10$...`, no whitespace.
+    // The mask above only shows first-4 and last-4, so a key that lost or gained characters
+    // in the middle looks identical to a good one — which is the failure mode in #22, where
+    // re-pasting from the same bad source reproduced it every time. Length is the signal the
+    // mask cannot carry, so report it and let the admin UI compare against 60.
+    let key_len = ext.curseforge_api_key.chars().count();
     let malformed = !ext.curseforge_api_key.is_empty()
         && (!ext.curseforge_api_key.starts_with("$2a$")
+            || key_len != CF_API_KEY_LEN
             || ext.curseforge_api_key.chars().any(|c| c.is_whitespace() || c.is_control()));
     Ok(axum::Json(serde_json::json!({
         "curseforge_configured": !ext.curseforge_api_key.is_empty(),
         "curseforge_api_key_masked": masked,
         "curseforge_api_key_malformed": malformed,
+        "curseforge_api_key_length": key_len,
+        "curseforge_api_key_expected_length": CF_API_KEY_LEN,
     })))
 }
 
