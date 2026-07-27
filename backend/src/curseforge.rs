@@ -42,6 +42,15 @@ async fn cf_get(url: &str, api_key: &str) -> Result<String, (StatusCode, String)
         .map_err(|e| err(StatusCode::BAD_GATEWAY, format!("CurseForge request failed: {e}")))?;
 
     let status = resp.status();
+    // Who actually answered. CurseForge's own API is served by Kestrel; anything else on a
+    // 401/403 means a proxy or CDN edge replied instead of them, which is the difference
+    // between "your key is wrong" and "your server never reached CurseForge" (#22).
+    let via = resp
+        .headers()
+        .get(reqwest::header::SERVER)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("unidentified")
+        .to_string();
     let body = resp
         .text()
         .await
@@ -56,12 +65,26 @@ async fn cf_get(url: &str, api_key: &str) -> Result<String, (StatusCode, String)
         // intermediary proxy can produce one too, and only the body tells them apart —
         // CurseForge answers `Forbidden: API Key missing or invalid` in plain text.
         // Dropping it for a canned message cost a full round-trip with a reporter (#22).
-        StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => err(
+        StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN if via == "Kestrel" => err(
             StatusCode::SERVICE_UNAVAILABLE,
             format!(
                 "CurseForge rejected the API key ({status}). Check it under \
                  Admin -> Content Installer: keys are exactly 60 characters and start with \
                  `$2a$`. Upstream said: {body}"
+            ),
+        ),
+        // Not Kestrel, so CurseForge never saw this request — a proxy or CDN edge answered
+        // for them. Every genuine CurseForge rejection carries the 37-byte body
+        // `Forbidden: API Key missing or invalid`; an empty one never comes from them.
+        // Re-pasting the key cannot fix this, so do not send the user chasing it.
+        StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => err(
+            StatusCode::BAD_GATEWAY,
+            format!(
+                "Blocked before reaching CurseForge: {status} from `{via}`, not CurseForge \
+                 (their API always answers as `Kestrel`). Something between this panel and \
+                 api.curseforge.com refused the request — check HTTP_PROXY/HTTPS_PROXY/ALL_PROXY \
+                 in the panel's environment, and any egress filtering. This is not an API key \
+                 problem. Upstream said: {body}"
             ),
         ),
         StatusCode::TOO_MANY_REQUESTS => err(
