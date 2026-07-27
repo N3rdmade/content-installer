@@ -52,12 +52,17 @@ async fn cf_get(url: &str, api_key: &str) -> Result<String, (StatusCode, String)
     }
 
     Err(match status {
+        // Keep the upstream body. A 401/403 usually comes from CurseForge itself, but an
+        // intermediary proxy can produce one too, and only the body tells them apart —
+        // CurseForge answers `Forbidden: API Key missing or invalid` in plain text.
+        // Dropping it for a canned message cost a full round-trip with a reporter (#22).
         StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => err(
             StatusCode::SERVICE_UNAVAILABLE,
-            "CurseForge rejected the API key. Check it under Admin -> Content Installer. \
-             Keys look like `$2a$10$...` and are silently truncated by unquoted shell, \
-             .env or compose files, which eats the `$2a` and `$10` as variables."
-                .to_string(),
+            format!(
+                "CurseForge rejected the API key ({status}). Check it under \
+                 Admin -> Content Installer: keys are exactly 60 characters and start with \
+                 `$2a$`. Upstream said: {body}"
+            ),
         ),
         StatusCode::TOO_MANY_REQUESTS => err(
             StatusCode::TOO_MANY_REQUESTS,
