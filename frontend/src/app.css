@@ -140,10 +140,18 @@
 .ci-detail-top-right {
   display: flex;
   align-items: center;
+  justify-content: flex-end;
   gap: 8px;
-  flex-shrink: 0;
-  margin-right: 32px;
+  flex-wrap: wrap;
+  min-width: 0;
+  margin-right: 32px; /* clearance for the floating modal X */
   margin-top: 6px;
+}
+
+/* Never let the install button get squeezed by a long version label — the
+   select yields (wraps) first. */
+.ci-detail-top-right .mantine-Button-root {
+  flex-shrink: 0;
 }
 
 .ci-detail-header {

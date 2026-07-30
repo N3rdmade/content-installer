@@ -431,12 +431,21 @@ export default function BrowseTab({ detection, contentType, installDir, onInstal
     }));
   }, [selectedProject?.source, modrinthVersions, cfFiles]);
 
-  // Size the version select to the longest option so the chosen value never
-  // truncates in the closed input (#18). ~7.1px/char at size sm + 60px chrome.
+  // Size the version select to the SELECTED label so the chosen value never
+  // truncates in the closed input (#18) without reserving space for the
+  // longest option — that padded the row with dead space and squeezed the
+  // install button. The open dropdown sizes itself (width: max-content).
+  // ~7.1px/char at size sm + 60px chrome.
   const versionSelectWidth = useMemo(() => {
-    const longest = versionOptions.reduce((m, o) => Math.max(m, o.label.length), 0);
-    return Math.min(Math.max(220, Math.round(longest * 7.1) + 60), 560);
-  }, [versionOptions]);
+    const selectedId =
+      selectedProject?.source === 'modrinth'
+        ? (selectedModrinthVersion?.id ?? null)
+        : selectedCfFile
+          ? String(selectedCfFile.id)
+          : null;
+    const current = versionOptions.find((o) => o.value === selectedId)?.label ?? '';
+    return Math.min(Math.max(200, Math.round(current.length * 7.1) + 60), 440);
+  }, [versionOptions, selectedProject?.source, selectedModrinthVersion, selectedCfFile]);
 
   const hasVersions = selectedProject?.source === 'modrinth' ? modrinthVersions.length > 0 : cfFiles.length > 0;
   const hasSelection = selectedProject?.source === 'modrinth' ? !!selectedModrinthVersion : !!selectedCfFile;
