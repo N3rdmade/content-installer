@@ -70,6 +70,20 @@ interface ModpackProgress {
   error?: string;
 }
 
+const MODPACK_STATUS_POLL_MS = 5_000;
+const MODPACK_INSTALL_TIMEOUT_MS = 3 * 60 * 60 * 1_000;
+
+function retryAfterMilliseconds(response: Response): number | null {
+  const value = response.headers.get('Retry-After');
+  if (!value) return null;
+
+  const seconds = Number(value);
+  if (Number.isFinite(seconds)) return Math.max(0, seconds * 1_000);
+
+  const date = Date.parse(value);
+  return Number.isNaN(date) ? null : Math.max(0, date - Date.now());
+}
+
 // Content comes from Modrinth/CurseForge project descriptions (trusted API sources)
 
 export default function ModpacksTab({ detection }: ModpacksTabProps) {
@@ -316,22 +330,46 @@ export default function ModpacksTab({ detection }: ModpacksTabProps) {
       const res = await fetch(`${endpoint}?${params}`, { method: 'POST' });
       if (!res.ok) throw new Error(await res.text() || `Install failed: ${res.status}`);
 
-      // Poll for progress
+      // Large packs can take well over 15 minutes. Poll slowly enough to stay
+      // below the panel-wide client API rate limit and keep going until the
+      // backend reports a terminal state.
       const statusUrl = `/api/client/servers/${server.uuid}/content-installer/modpack/status`;
-      for (let i = 0; i < 600; i++) {
-        await new Promise((r) => setTimeout(r, 1500));
+      const deadline = Date.now() + MODPACK_INSTALL_TIMEOUT_MS;
+      let consecutiveStatusFailures = 0;
+      let completed = false;
+
+      while (Date.now() < deadline) {
+        await new Promise((r) => setTimeout(r, MODPACK_STATUS_POLL_MS));
         const statusRes = await fetch(statusUrl);
-        if (!statusRes.ok) continue;
+        if (statusRes.status === 429) {
+          const retryAfter = retryAfterMilliseconds(statusRes) ?? 15_000;
+          await new Promise((r) => setTimeout(r, retryAfter));
+          continue;
+        }
+        if (!statusRes.ok) {
+          consecutiveStatusFailures += 1;
+          if (consecutiveStatusFailures >= 12) {
+            throw new Error(`Lost install status: HTTP ${statusRes.status}`);
+          }
+          continue;
+        }
+
+        consecutiveStatusFailures = 0;
         const status: ModpackProgress = await statusRes.json();
         setProgress(status);
 
         if (status.state === 'done') {
           addToast(`Modpack "${selectedModpack.title}" installed successfully!`, 'success');
+          completed = true;
           break;
         }
         if (status.state === 'error') {
           throw new Error(status.error ?? 'Installation failed');
         }
+      }
+
+      if (!completed) {
+        throw new Error('Installation did not finish within 3 hours');
       }
     } catch (err) {
       addToast(`Modpack install failed: ${err instanceof Error ? err.message : 'unknown'}`, 'error');

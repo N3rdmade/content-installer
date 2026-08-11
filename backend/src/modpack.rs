@@ -104,6 +104,45 @@ pub fn create_progress_map() -> ProgressMap {
     Arc::new(Mutex::new(HashMap::new()))
 }
 
+// A large pack can trigger transient CDN or Wings gateway limits even though
+// downloads run sequentially. Keep permanent errors fast, but let throttles
+// and short upstream outages recover without abandoning an otherwise valid
+// install.
+pub const PULL_MAX_ATTEMPTS: u32 = 7;
+
+pub fn is_retryable_pull_status(status: u16) -> bool {
+    matches!(status, 408 | 425 | 429 | 500 | 502 | 503 | 504)
+}
+
+pub fn is_retryable_pull_error(error: &str) -> bool {
+    let error = error.to_ascii_lowercase();
+    [
+        "status code 408",
+        "status code 425",
+        "status code 429",
+        "status code 500",
+        "status code 502",
+        "status code 503",
+        "status code 504",
+        "connection reset",
+        "connection refused",
+        "connection closed",
+        "temporarily unavailable",
+        "timed out",
+        "timeout",
+        "unexpected eof",
+        "incomplete message",
+    ]
+    .iter()
+    .any(|needle| error.contains(needle))
+}
+
+pub fn pull_retry_delay_seconds(error: &str, failed_attempt: u32) -> u64 {
+    let base = if error.contains("429") { 15 } else { 2 };
+    let exponent = failed_attempt.saturating_sub(1).min(3);
+    (base * (1u64 << exponent)).min(120)
+}
+
 // ─── Remote client-only mod exclusion list ──────────────────
 // Fetched from GitHub at runtime so the list can be updated without rebuilding.
 // Falls back to a minimal hardcoded list if the fetch fails.
@@ -385,4 +424,66 @@ pub fn is_protected_path(path: &str) -> bool {
     PROTECTED_PATHS.iter().any(|p| {
         normalized == *p || normalized.starts_with(&format!("{p}/"))
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_file(path: &str, server_environment: Option<&str>) -> MrpackFile {
+        MrpackFile {
+            path: path.to_string(),
+            env: server_environment.map(|server| MrpackEnv {
+                server: Some(server.to_string()),
+            }),
+            downloads: vec!["https://cdn.modrinth.com/test.jar".to_string()],
+        }
+    }
+
+    #[test]
+    fn mrpack_environment_controls_server_installation() {
+        let index = MrpackIndex {
+            name: "test".to_string(),
+            files: vec![
+                test_file("mods/required.jar", None),
+                test_file("mods/optional.jar", Some("optional")),
+                test_file("mods/client.jar", Some("unsupported")),
+            ],
+            dependencies: HashMap::new(),
+        };
+
+        let paths: Vec<&str> = index
+            .server_files()
+            .into_iter()
+            .map(|file| file.path.as_str())
+            .collect();
+        assert_eq!(paths, ["mods/required.jar", "mods/optional.jar"]);
+    }
+
+    #[test]
+    fn transient_pull_errors_are_retryable() {
+        assert!(is_retryable_pull_error("Request failed with status code 429"));
+        assert!(is_retryable_pull_error("connection reset by peer"));
+        assert!(is_retryable_pull_error("operation timed out"));
+        assert!(is_retryable_pull_status(429));
+        assert!(is_retryable_pull_status(503));
+    }
+
+    #[test]
+    fn permanent_pull_errors_fail_without_retry() {
+        assert!(!is_retryable_pull_error("Request failed with status code 403"));
+        assert!(!is_retryable_pull_error("Request failed with status code 404"));
+        assert!(!is_retryable_pull_error("invalid download URL"));
+        assert!(!is_retryable_pull_status(403));
+        assert!(!is_retryable_pull_status(404));
+    }
+
+    #[test]
+    fn pull_retry_delay_backs_off_and_caps() {
+        assert_eq!(pull_retry_delay_seconds("429", 1), 15);
+        assert_eq!(pull_retry_delay_seconds("429", 2), 30);
+        assert_eq!(pull_retry_delay_seconds("429", 4), 120);
+        assert_eq!(pull_retry_delay_seconds("503", 1), 2);
+        assert_eq!(pull_retry_delay_seconds("503", 4), 16);
+    }
 }
