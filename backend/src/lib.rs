@@ -1,5 +1,5 @@
 mod curseforge;
-mod modpack;
+mod install_script;
 mod settings;
 
 use axum::{extract::Query, http::StatusCode, response::IntoResponse};
@@ -9,139 +9,14 @@ use shared::{
     extensions::{Extension, ExtensionRouteBuilder},
     models::{
         server::GetServer,
-        user::{GetPermissionManager, GetUser},
+        user::GetPermissionManager,
     },
     State,
 };
 use std::sync::Arc;
-use wings_api::client::AsyncRequestReader;
 
 /// CurseForge API keys are bcrypt hashes and always this long.
 const CF_API_KEY_LEN: usize = 60;
-
-// ── wings-api 1.1.0 request helpers ──
-// Panel 1.1.0 moved file path / options off positional args into typed Query
-// structs, and file writes now take a streamed body. These wrappers keep the
-// call sites terse.
-#[inline]
-fn q_contents(
-    file: &str,
-    download: bool,
-    max_size: u64,
-) -> wings_api::servers_server_files_contents::get::Query {
-    wings_api::servers_server_files_contents::get::Query {
-        file: Some(file.into()),
-        download: Some(download),
-        max_size: Some(max_size),
-        ..Default::default()
-    }
-}
-#[inline]
-fn q_write(file: &str, user: uuid::Uuid) -> wings_api::servers_server_files_write::post::Query {
-    wings_api::servers_server_files_write::post::Query {
-        file: Some(file.into()),
-        user: Some(user),
-        ..Default::default()
-    }
-}
-#[inline]
-fn body_bytes(data: impl Into<Vec<u8>>) -> AsyncRequestReader {
-    AsyncRequestReader::new(std::io::Cursor::new(data.into()))
-}
-
-#[derive(Deserialize)]
-struct CompatibleDirectoryEntry {
-    name: compact_str::CompactString,
-}
-
-/// List names without decoding the complete generated DirectoryEntry model.
-/// Older Wings versions do not include newer fields such as `virtual`, which
-/// made otherwise valid listings fail to decode and silently skipped overrides.
-async fn list_directory_names(
-    wings: &wings_api::client::WingsClient,
-    server_uuid: uuid::Uuid,
-    directory: &str,
-    missing_is_empty: bool,
-) -> Result<Vec<compact_str::CompactString>, String> {
-    let response = wings
-        .request_raw(
-            reqwest::Method::GET,
-            format!("/api/servers/{server_uuid}/files/list-directory"),
-        )
-        .header(reqwest::header::ACCEPT, "application/json")
-        .query(&[("directory", directory)])
-        .send()
-        .await
-        .map_err(|error| format!("Failed to list {directory}: {error}"))?;
-
-    if response.status() == reqwest::StatusCode::NOT_FOUND && missing_is_empty {
-        return Ok(Vec::new());
-    }
-
-    if !response.status().is_success() {
-        let status = response.status();
-        let detail = response
-            .text()
-            .await
-            .unwrap_or_else(|error| format!("unable to read response: {error}"));
-        return Err(format!("Failed to list {directory}: HTTP {status}: {detail}"));
-    }
-
-    response
-        .json::<Vec<CompatibleDirectoryEntry>>()
-        .await
-        .map(|entries| entries.into_iter().map(|entry| entry.name).collect())
-        .map_err(|error| format!("Failed to decode listing for {directory}: {error}"))
-}
-
-async fn pull_file_with_retry(
-    wings: &wings_api::client::WingsClient,
-    server_uuid: uuid::Uuid,
-    request: &wings_api::servers_server_files_pull::post::RequestBody,
-    failure_context: &str,
-) -> Result<(), String> {
-    for attempt in 1..=modpack::PULL_MAX_ATTEMPTS {
-        match wings
-            .post_servers_server_files_pull(server_uuid, request)
-            .await
-        {
-            Ok(_) => return Ok(()),
-            Err(error) => {
-                let detail = format!("{error:?}");
-                let retryable = match &error {
-                    wings_api::client::ApiHttpError::Http(status, api_error) => {
-                        modpack::is_retryable_pull_status(status.as_u16())
-                            || modpack::is_retryable_pull_error(&api_error.error)
-                    }
-                    wings_api::client::ApiHttpError::Reqwest(error) => {
-                        error.is_timeout()
-                            || error.is_connect()
-                            || error
-                                .status()
-                                .is_some_and(|status| modpack::is_retryable_pull_status(status.as_u16()))
-                    }
-                    _ => false,
-                };
-
-                if attempt == modpack::PULL_MAX_ATTEMPTS || !retryable {
-                    return Err(format!("{failure_context}: {detail}"));
-                }
-
-                let delay = modpack::pull_retry_delay_seconds(&detail, attempt);
-                tracing::warn!(
-                    attempt,
-                    max_attempts = modpack::PULL_MAX_ATTEMPTS,
-                    delay_seconds = delay,
-                    error = %detail,
-                    "transient file pull failed; retrying"
-                );
-                tokio::time::sleep(std::time::Duration::from_secs(delay)).await;
-            }
-        }
-    }
-
-    unreachable!("pull retry loop always returns")
-}
 
 #[derive(Default)]
 pub struct ExtensionStruct;
@@ -162,14 +37,8 @@ impl Extension for ExtensionStruct {
         _state: State,
         builder: ExtensionRouteBuilder,
     ) -> ExtensionRouteBuilder {
-        let progress = modpack::create_progress_map();
-        let progress_install = progress.clone();
-        let progress_status = progress.clone();
-
         builder
-            .add_client_server_api_router(move |router| {
-                let pi = progress_install.clone();
-                let ps = progress_status.clone();
+            .add_client_server_api_router(|router| {
                 router
                     .route(
                         "/content-installer/install",
@@ -205,27 +74,11 @@ impl Extension for ExtensionStruct {
                     )
                     .route(
                         "/content-installer/modpack/install",
-                        axum::routing::post({
-                            let pi = pi.clone();
-                            move |state, perms, user, server, query| {
-                                modpack_install(state, perms, user, server, query, pi.clone())
-                            }
-                        }),
+                        axum::routing::post(modpack_install),
                     )
                     .route(
                         "/content-installer/modpack/cf-install",
-                        axum::routing::post({
-                            let pi2 = pi.clone();
-                            move |state, perms, user, server, query| {
-                                cf_modpack_install(state, perms, user, server, query, pi2.clone())
-                            }
-                        }),
-                    )
-                    .route(
-                        "/content-installer/modpack/status",
-                        axum::routing::get(move |server| {
-                            modpack_status(server, ps.clone())
-                        }),
+                        axum::routing::post(cf_modpack_install),
                     )
             })
             .add_admin_api_router(|router| {
@@ -527,14 +380,12 @@ struct ModpackInstallParams {
     clean_install: bool,
 }
 
-/// POST: Install a modpack from an mrpack URL
+/// POST: Install a Modrinth modpack (.mrpack).
 async fn modpack_install(
     state: GetState,
     permissions: GetPermissionManager,
-    user: GetUser,
     server: GetServer,
     Query(params): Query<ModpackInstallParams>,
-    progress_map: modpack::ProgressMap,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     permissions
         .has_server_permission("files.create")
@@ -545,497 +396,26 @@ async fn modpack_install(
         return Err(err(StatusCode::BAD_REQUEST, "mrpack URL must be from cdn.modrinth.com"));
     }
 
-    // Initialize progress
-    {
-        let mut map = progress_map.lock().await;
-        map.insert(server.uuid, modpack::ModpackProgress::default());
+    // Refuse while the server itself is installing/restoring: the panel owns
+    // that flag and `Server::install` re-checks it transactionally.
+    if server.status.is_some() {
+        return Err(err(
+            StatusCode::CONFLICT,
+            "Server is already installing or restoring a backup",
+        ));
     }
 
-    let node = server
-        .node
-        .fetch_cached(&state.database)
+    server
+        .install(
+            &state,
+            params.clean_install,
+            Some(install_script::modrinth_script(&params.mrpack_url)),
+        )
         .await
-        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")))?;
-
-    let wings = node
-        .api_client(&state.database)
-        .await
-        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")))?;
-
-    let server_uuid = server.uuid;
-    let user_uuid = user.uuid;
-    let pm = progress_map.clone();
-
-    // Spawn the installation as a background task
-    tokio::spawn(async move {
-        let result = run_modpack_install(wings, server_uuid, user_uuid, params, pm.clone()).await;
-        if let Err(e) = result {
-            let mut map = pm.lock().await;
-            if let Some(prog) = map.get_mut(&server_uuid) {
-                prog.state = "error".to_string();
-                prog.error = Some(e);
-            }
-        }
-    });
+        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to start install: {e}")))?;
 
     Ok(axum::Json(serde_json::json!({ "success": true })))
 }
-
-struct LoaderJar {
-    url: String,
-    is_zip: bool,
-}
-
-/// Resolve the loader server jar from the mrpack dependencies.
-/// Fabric/Quilt: meta API gives a single ready-to-run jar (direct download).
-/// Forge/NeoForge: MCJars provides zip bundles that need decompression.
-async fn resolve_loader_jar(dependencies: &std::collections::HashMap<String, String>, mc_version: &str) -> Option<LoaderJar> {
-    // Fabric: direct jar from meta API
-    if let Some(loader_ver) = dependencies.get("fabric-loader") {
-        return Some(LoaderJar {
-            url: format!("https://meta.fabricmc.net/v2/versions/loader/{mc_version}/{loader_ver}/1.0.1/server/jar"),
-            is_zip: false,
-        });
-    }
-
-    // Quilt: direct jar from meta API
-    if let Some(loader_ver) = dependencies.get("quilt-loader") {
-        return Some(LoaderJar {
-            url: format!("https://meta.quiltmc.org/v3/versions/loader/{mc_version}/{loader_ver}/0.10.3/server/jar"),
-            is_zip: false,
-        });
-    }
-
-    // NeoForge: query MCJars for the zip URL
-    if dependencies.contains_key("neoforge") {
-        if let Ok(resp) = reqwest::get(format!("https://versions.mcjars.app/api/v2/builds/NEOFORGE/{mc_version}")).await {
-            if let Ok(data) = resp.json::<serde_json::Value>().await {
-                if let Some(zip_url) = data["builds"][0]["zipUrl"].as_str() {
-                    return Some(LoaderJar { url: zip_url.to_string(), is_zip: true });
-                }
-            }
-        }
-    }
-
-    // Forge: query MCJars for the zip URL
-    if dependencies.contains_key("forge") {
-        if let Ok(resp) = reqwest::get(format!("https://versions.mcjars.app/api/v2/builds/FORGE/{mc_version}")).await {
-            if let Ok(data) = resp.json::<serde_json::Value>().await {
-                if let Some(zip_url) = data["builds"][0]["zipUrl"].as_str() {
-                    return Some(LoaderJar { url: zip_url.to_string(), is_zip: true });
-                }
-            }
-        }
-    }
-
-    None
-}
-
-/// Background task that runs the full modpack installation
-async fn run_modpack_install(
-    wings: wings_api::client::WingsClient,
-    server_uuid: uuid::Uuid,
-    user_uuid: uuid::Uuid,
-    params: ModpackInstallParams,
-    progress_map: modpack::ProgressMap,
-) -> Result<(), String> {
-    let update_progress = |state: &str, downloaded: u32, total: u32, current: &str| {
-        let pm = progress_map.clone();
-        let state = state.to_string();
-        let current = current.to_string();
-        async move {
-            let mut map = pm.lock().await;
-            if let Some(prog) = map.get_mut(&server_uuid) {
-                prog.state = state;
-                prog.total_files = total;
-                prog.downloaded_files = downloaded;
-                prog.current_file = current;
-            }
-        }
-    };
-
-    // Step 1: Clean install if requested
-    if params.clean_install {
-        update_progress("preparing", 0, 0, "Wiping server files...").await;
-        let files = list_directory_names(&wings, server_uuid, "/", false).await?;
-        if !files.is_empty() {
-            wings
-                .post_servers_server_files_delete(
-                    server_uuid,
-                    &wings_api::servers_server_files_delete::post::RequestBody {
-                        root: "/".into(),
-                        files,
-                    },
-                )
-                .await
-                .map_err(|error| format!("Failed to wipe server files: {error:?}"))?;
-        }
-    }
-
-    // Step 2: Download mrpack to server
-    update_progress("preparing", 0, 0, "Downloading modpack...").await;
-    pull_file_with_retry(
-        &wings,
-        server_uuid,
-        &wings_api::servers_server_files_pull::post::RequestBody {
-            root: "/".into(),
-            url: params.mrpack_url.into(),
-            file_name: Some("_mrpack_install.zip".into()),
-            use_header: false,
-            foreground: true,
-        },
-        "Failed to download mrpack",
-    )
-    .await?;
-
-    // Step 3: Decompress mrpack to temp directory
-    update_progress("preparing", 0, 0, "Extracting modpack...").await;
-    let _ = wings
-        .post_servers_server_files_create_directory(
-            server_uuid,
-            &wings_api::servers_server_files_create_directory::post::RequestBody {
-                root: "/".into(),
-                name: "_mrpack_temp".into(),
-            },
-        )
-        .await;
-
-    wings
-        .post_servers_server_files_decompress(
-            server_uuid,
-            &wings_api::servers_server_files_decompress::post::RequestBody {
-                root: "/_mrpack_temp".into(),
-                file: "/_mrpack_install.zip".into(),
-                foreground: true,
-            },
-        )
-        .await
-        .map_err(|e| format!("Failed to decompress mrpack: {e:?}"))?;
-
-    // Step 4: Read modrinth.index.json from the server
-    update_progress("preparing", 0, 0, "Reading modpack index...").await;
-    let mut index_data = wings
-        .get_servers_server_files_contents(
-            server_uuid,
-            &q_contents("/_mrpack_temp/modrinth.index.json", false, 10_000_000), // 10MB max
-        )
-        .await
-        .map_err(|e| format!("Failed to read modrinth.index.json: {e:?}"))?;
-
-    // Read the async stream to a string
-    let mut index_bytes = Vec::new();
-    tokio::io::AsyncReadExt::read_to_end(&mut index_data, &mut index_bytes)
-        .await
-        .map_err(|e| format!("Failed to read index data: {e}"))?;
-
-    let index: modpack::MrpackIndex = serde_json::from_slice(&index_bytes)
-        .map_err(|e| format!("Failed to parse modrinth.index.json: {e}"))?;
-
-    // Step 5: Apply overrides (copy from temp to server root)
-    update_progress("applying_overrides", 0, 0, "Applying config overrides...").await;
-
-    // Move overrides/ contents to root
-    let override_entries =
-        list_directory_names(&wings, server_uuid, "/_mrpack_temp/overrides", true).await?;
-
-    for entry_name in &override_entries {
-        if !modpack::is_protected_path(entry_name) {
-            let result = wings
-                .put_servers_server_files_rename(
-                    server_uuid,
-                    &wings_api::servers_server_files_rename::put::RequestBody {
-                        root: "/".into(),
-                        files: vec![wings_api::servers_server_files_rename::put::RequestBodyFiles {
-                            from: format!("_mrpack_temp/overrides/{entry_name}").into(),
-                            to: entry_name.clone(),
-                        }],
-                    },
-                )
-                .await
-                .map_err(|error| format!("Failed to apply override {entry_name}: {error:?}"))?;
-            if result.renamed != 1 {
-                return Err(format!(
-                    "Failed to apply override {entry_name}: Wings renamed {} files",
-                    result.renamed
-                ));
-            }
-        }
-    }
-
-    // Move server-overrides/ contents to root (layered on top)
-    let server_override_entries =
-        list_directory_names(&wings, server_uuid, "/_mrpack_temp/server-overrides", true).await?;
-
-    for entry_name in &server_override_entries {
-        if !modpack::is_protected_path(entry_name) {
-            let result = wings
-                .put_servers_server_files_rename(
-                    server_uuid,
-                    &wings_api::servers_server_files_rename::put::RequestBody {
-                        root: "/".into(),
-                        files: vec![wings_api::servers_server_files_rename::put::RequestBodyFiles {
-                            from: format!("_mrpack_temp/server-overrides/{entry_name}").into(),
-                            to: entry_name.clone(),
-                        }],
-                    },
-                )
-                .await
-                .map_err(|error| {
-                    format!("Failed to apply server override {entry_name}: {error:?}")
-                })?;
-            if result.renamed != 1 {
-                return Err(format!(
-                    "Failed to apply server override {entry_name}: Wings renamed {} files",
-                    result.renamed
-                ));
-            }
-        }
-    }
-
-    // Step 6: Honor the per-file environment declared by the mrpack.
-    // Project-level environment metadata is not authoritative for a specific pack:
-    // client-side library projects can still be hard dependencies of server mods.
-    update_progress("preparing", 0, 0, "Checking mod compatibility...").await;
-
-    let installable_files = index.server_files();
-
-    let total = installable_files.len() as u32;
-    tracing::info!(
-        "Installing {total} mrpack files ({} explicitly unsupported on servers skipped)",
-        index.files.len().saturating_sub(installable_files.len())
-    );
-
-    // Ensure mods/ directory exists
-    let _ = wings
-        .post_servers_server_files_create_directory(
-            server_uuid,
-            &wings_api::servers_server_files_create_directory::post::RequestBody {
-                root: "/".into(),
-                name: "mods".into(),
-            },
-        )
-        .await;
-
-    for (i, file) in installable_files.iter().enumerate() {
-        // Validate path
-        if !modpack::validate_path(&file.path) {
-            tracing::warn!("Skipping file with invalid path: {}", file.path);
-            continue;
-        }
-
-        // Get first valid download URL
-        let download_url = file.downloads.iter()
-            .find(|u| modpack::validate_download_url(u))
-            .ok_or_else(|| format!("No valid download URL for {}", file.path))?;
-
-        let filename = file.path.rsplit('/').next().unwrap_or(&file.path);
-        let dir = if file.path.contains('/') {
-            file.path.rsplit_once('/').map(|(d, _)| d).unwrap_or("/")
-        } else {
-            "/"
-        };
-
-        update_progress("downloading_mods", i as u32, total, filename).await;
-
-        // Ensure parent directory exists
-        if dir != "/" && !dir.is_empty() {
-            let _ = wings
-                .post_servers_server_files_create_directory(
-                    server_uuid,
-                    &wings_api::servers_server_files_create_directory::post::RequestBody {
-                        root: "/".into(),
-                        name: dir.into(),
-                    },
-                )
-                .await;
-        }
-
-        // Download the file
-        let root = if dir == "/" || dir.is_empty() {
-            "/".to_string()
-        } else {
-            format!("/{dir}")
-        };
-
-        pull_file_with_retry(
-            &wings,
-            server_uuid,
-            &wings_api::servers_server_files_pull::post::RequestBody {
-                root: root.into(),
-                url: download_url.clone().into(),
-                file_name: Some(filename.into()),
-                use_header: false,
-                foreground: true,
-            },
-            &format!("Failed to download {}", file.path),
-        )
-        .await?;
-    }
-
-    // Step 7: Auto-install loader based on mrpack dependencies
-    update_progress("installing_loader", total, total, "Installing server loader...").await;
-
-    let mc_version = index.minecraft_version().unwrap_or("1.21.1");
-    let loader_jar = resolve_loader_jar(&index.dependencies, mc_version).await;
-    tracing::info!("Loader jar resolved: {:?}", loader_jar.as_ref().map(|j| (&j.url, j.is_zip)));
-
-    if let Some(jar) = &loader_jar {
-        if jar.is_zip {
-            // Forge/NeoForge: download zip, decompress, clean up
-            pull_file_with_retry(
-                &wings,
-                server_uuid,
-                &wings_api::servers_server_files_pull::post::RequestBody {
-                    root: "/".into(),
-                    url: jar.url.clone().into(),
-                    file_name: Some("_loader_install.zip".into()),
-                    use_header: false,
-                    foreground: true,
-                },
-                "Failed to download loader",
-            )
-            .await?;
-
-            let _ = wings
-                .post_servers_server_files_decompress(
-                    server_uuid,
-                    &wings_api::servers_server_files_decompress::post::RequestBody {
-                        root: "/".into(),
-                        file: "_loader_install.zip".into(),
-                        foreground: true,
-                    },
-                )
-                .await;
-
-            let _ = wings
-                .post_servers_server_files_delete(
-                    server_uuid,
-                    &wings_api::servers_server_files_delete::post::RequestBody {
-                        root: "/".into(),
-                        files: vec!["_loader_install.zip".into()],
-                    },
-                )
-                .await;
-        } else {
-            // Fabric/Quilt: single jar download
-            tracing::info!("Pulling loader jar from: {}", jar.url);
-            pull_file_with_retry(
-                &wings,
-                server_uuid,
-                &wings_api::servers_server_files_pull::post::RequestBody {
-                    root: "/".into(),
-                    url: jar.url.clone().into(),
-                    file_name: Some("server.jar".into()),
-                    use_header: false,
-                    foreground: true,
-                },
-                "Failed to download loader jar",
-            )
-            .await?;
-            tracing::info!("Loader pull completed");
-        }
-    }
-
-    // Step 8: Post-download scan of ALL jars in mods/ for client-only mods.
-    // This catches jars introduced through overrides or packs that omitted per-file
-    // environment metadata. JAR metadata is specific to the installed artifact.
-    update_progress("installing_loader", total, total, "Scanning for client-only mods...").await;
-
-    let mods_entries = list_directory_names(&wings, server_uuid, "/mods", true).await?;
-
-    let mut jars_to_remove: Vec<String> = Vec::new();
-    for entry_name in &mods_entries {
-        if !entry_name.ends_with(".jar") { continue; }
-
-        // Read the jar to inspect loader metadata.
-        if let Ok(mut file_data) = wings
-            .get_servers_server_files_contents(server_uuid, &q_contents(&format!("/mods/{entry_name}"), true, 50_000_000))
-            .await
-        {
-            let mut bytes = Vec::new();
-            if tokio::io::AsyncReadExt::read_to_end(&mut file_data, &mut bytes).await.is_ok() {
-                // JAR metadata inspection (fabric.mod.json, mods.toml, quilt.mod.json)
-                if modpack::is_client_only_jar(&bytes) {
-                    tracing::info!("Removing client-only mod (JAR metadata): {entry_name}");
-                    jars_to_remove.push(entry_name.to_string());
-                    continue;
-                }
-
-            }
-        }
-    }
-
-    // Delete client-only mods
-    if !jars_to_remove.is_empty() {
-        tracing::info!("Removing {} client-only mods from final scan", jars_to_remove.len());
-        let _ = wings
-            .post_servers_server_files_delete(
-                server_uuid,
-                &wings_api::servers_server_files_delete::post::RequestBody {
-                    root: "/mods".into(),
-                    files: jars_to_remove.iter().map(|s| compact_str::CompactString::from(s.as_str())).collect(),
-                },
-            )
-            .await;
-    }
-
-    // Step 9: Write eula.txt
-    let _ = wings
-        .post_servers_server_files_write(
-            server_uuid,
-            body_bytes("eula=true\n".to_string()),
-            &q_write("/eula.txt", user_uuid),
-        )
-        .await;
-
-    // Step 10: Write .mcvc-type.json marker
-    {
-        let loader_type = if index.dependencies.contains_key("fabric-loader") { "FABRIC" }
-            else if index.dependencies.contains_key("quilt-loader") { "QUILT" }
-            else if index.dependencies.contains_key("neoforge") { "NEOFORGE" }
-            else if index.dependencies.contains_key("forge") { "FORGE" }
-            else { "UNKNOWN" };
-        let marker = serde_json::json!({
-            "type": loader_type,
-            "version": mc_version,
-            "modpack": index.name,
-            "installedAt": chrono::Utc::now().to_rfc3339(),
-        });
-        let _ = wings
-            .post_servers_server_files_write(
-                server_uuid,
-                body_bytes(serde_json::to_string(&marker).unwrap_or_default()),
-                &q_write("/.mcvc-type.json", user_uuid),
-            )
-            .await;
-    }
-
-    // Step 11: Clean up temp files
-    update_progress("done", total, total, "Cleaning up...").await;
-    let _ = wings
-        .post_servers_server_files_delete(
-            server_uuid,
-            &wings_api::servers_server_files_delete::post::RequestBody {
-                root: "/".into(),
-                files: vec!["_mrpack_temp".into(), "_mrpack_install.zip".into()],
-            },
-        )
-        .await;
-
-    // Mark as done
-    {
-        let mut map = progress_map.lock().await;
-        if let Some(prog) = map.get_mut(&server_uuid) {
-            prog.state = "done".to_string();
-            prog.downloaded_files = total;
-            prog.current_file = String::new();
-        }
-    }
-
-    Ok(())
-}
-
-// ─── CurseForge Modpack Installation ─────────────────────────
 
 #[derive(Deserialize)]
 struct CfModpackInstallParams {
@@ -1045,13 +425,14 @@ struct CfModpackInstallParams {
     clean_install: bool,
 }
 
+/// POST: Install a CurseForge modpack. Same native Wings install flow; the
+/// script receives the CurseForge API key through its environment to resolve
+/// file download URLs.
 async fn cf_modpack_install(
     state: GetState,
     permissions: GetPermissionManager,
-    user: GetUser,
     server: GetServer,
     Query(params): Query<CfModpackInstallParams>,
-    progress_map: modpack::ProgressMap,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     permissions
         .has_server_permission("files.create")
@@ -1064,7 +445,14 @@ async fn cf_modpack_install(
         return Err(err(StatusCode::BAD_REQUEST, "URL must be from CurseForge CDN"));
     }
 
-    // Get CF API key from settings
+    if server.status.is_some() {
+        return Err(err(
+            StatusCode::CONFLICT,
+            "Server is already installing or restoring a backup",
+        ));
+    }
+
+    // The install script needs the CurseForge API key to resolve downloads.
     let cf_api_key = {
         let settings_guard = state
             .settings
@@ -1080,458 +468,14 @@ async fn cf_modpack_install(
         ext.curseforge_api_key.to_string()
     };
 
-    {
-        let mut map = progress_map.lock().await;
-        map.insert(server.uuid, modpack::ModpackProgress::default());
-    }
-
-    let node = server
-        .node
-        .fetch_cached(&state.database)
+    server
+        .install(
+            &state,
+            params.clean_install,
+            Some(install_script::curseforge_script(&params.zip_url, &cf_api_key)),
+        )
         .await
-        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")))?;
-
-    let wings = node
-        .api_client(&state.database)
-        .await
-        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")))?;
-
-    let server_uuid = server.uuid;
-    let user_uuid = user.uuid;
-    let pm = progress_map.clone();
-
-    tokio::spawn(async move {
-        let result = run_cf_modpack_install(wings, server_uuid, user_uuid, params, cf_api_key, pm.clone()).await;
-        if let Err(e) = result {
-            let mut map = pm.lock().await;
-            if let Some(prog) = map.get_mut(&server_uuid) {
-                prog.state = "error".to_string();
-                prog.error = Some(e);
-            }
-        }
-    });
+        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to start install: {e}")))?;
 
     Ok(axum::Json(serde_json::json!({ "success": true })))
-}
-
-async fn run_cf_modpack_install(
-    wings: wings_api::client::WingsClient,
-    server_uuid: uuid::Uuid,
-    user_uuid: uuid::Uuid,
-    params: CfModpackInstallParams,
-    cf_api_key: String,
-    progress_map: modpack::ProgressMap,
-) -> Result<(), String> {
-    let update_progress = |state: &str, downloaded: u32, total: u32, current: &str| {
-        let pm = progress_map.clone();
-        let state = state.to_string();
-        let current = current.to_string();
-        async move {
-            let mut map = pm.lock().await;
-            if let Some(prog) = map.get_mut(&server_uuid) {
-                prog.state = state;
-                prog.total_files = total;
-                prog.downloaded_files = downloaded;
-                prog.current_file = current;
-            }
-        }
-    };
-
-    let http_client = reqwest::Client::new();
-
-    // Step 1: Clean install
-    if params.clean_install {
-        update_progress("preparing", 0, 0, "Wiping server files...").await;
-        let files = list_directory_names(&wings, server_uuid, "/", false).await?;
-        if !files.is_empty() {
-            wings
-                .post_servers_server_files_delete(
-                    server_uuid,
-                    &wings_api::servers_server_files_delete::post::RequestBody {
-                        root: "/".into(),
-                        files,
-                    },
-                )
-                .await
-                .map_err(|error| format!("Failed to wipe server files: {error:?}"))?;
-        }
-    }
-
-    // Step 2: Download modpack zip
-    update_progress("preparing", 0, 0, "Downloading modpack...").await;
-    pull_file_with_retry(
-        &wings,
-        server_uuid,
-        &wings_api::servers_server_files_pull::post::RequestBody {
-            root: "/".into(),
-            url: params.zip_url.into(),
-            file_name: Some("_cf_modpack.zip".into()),
-            use_header: false,
-            foreground: true,
-        },
-        "Failed to download modpack",
-    )
-    .await?;
-
-    // Step 3: Extract
-    update_progress("preparing", 0, 0, "Extracting modpack...").await;
-    let _ = wings
-        .post_servers_server_files_create_directory(
-            server_uuid,
-            &wings_api::servers_server_files_create_directory::post::RequestBody {
-                root: "/".into(),
-                name: "_cf_temp".into(),
-            },
-        )
-        .await;
-
-    wings
-        .post_servers_server_files_decompress(
-            server_uuid,
-            &wings_api::servers_server_files_decompress::post::RequestBody {
-                root: "/_cf_temp".into(),
-                file: "/_cf_modpack.zip".into(),
-                foreground: true,
-            },
-        )
-        .await
-        .map_err(|e| format!("Failed to decompress modpack: {e:?}"))?;
-
-    // Step 4: Read manifest.json
-    update_progress("preparing", 0, 0, "Reading manifest...").await;
-    let mut manifest_data = wings
-        .get_servers_server_files_contents(
-            server_uuid,
-            &q_contents("/_cf_temp/manifest.json", false, 10_000_000),
-        )
-        .await
-        .map_err(|e| format!("Failed to read manifest.json: {e:?}"))?;
-
-    let mut manifest_bytes = Vec::new();
-    tokio::io::AsyncReadExt::read_to_end(&mut manifest_data, &mut manifest_bytes)
-        .await
-        .map_err(|e| format!("Failed to read manifest data: {e}"))?;
-
-    let manifest: modpack::CfManifest = serde_json::from_slice(&manifest_bytes)
-        .map_err(|e| format!("Failed to parse manifest.json: {e}"))?;
-
-    // Step 5: Apply overrides
-    update_progress("applying_overrides", 0, 0, "Applying config overrides...").await;
-    let overrides_path = format!("/_cf_temp/{}", manifest.overrides);
-    let override_entries =
-        list_directory_names(&wings, server_uuid, &overrides_path, true).await?;
-
-    for entry_name in &override_entries {
-        if !modpack::is_protected_path(entry_name) {
-            let result = wings
-                .put_servers_server_files_rename(
-                    server_uuid,
-                    &wings_api::servers_server_files_rename::put::RequestBody {
-                        root: "/".into(),
-                        files: vec![wings_api::servers_server_files_rename::put::RequestBodyFiles {
-                            from: format!(
-                                "{}/{}",
-                                overrides_path.trim_start_matches('/'),
-                                entry_name
-                            )
-                            .into(),
-                            to: entry_name.clone(),
-                        }],
-                    },
-                )
-                .await
-                .map_err(|error| format!("Failed to apply override {entry_name}: {error:?}"))?;
-            if result.renamed != 1 {
-                return Err(format!(
-                    "Failed to apply override {entry_name}: Wings renamed {} files",
-                    result.renamed
-                ));
-            }
-        }
-    }
-
-    // Step 6: Resolve and download mods from CurseForge API
-    update_progress("preparing", 0, 0, "Checking mod compatibility...").await;
-
-    let exclusion_list = modpack::fetch_exclusion_list(&http_client).await;
-
-    // Batch resolve files from CF API (we need download URLs)
-    // Process in chunks of 50 to avoid API limits
-    let required_files: Vec<&modpack::CfManifestFile> = manifest.files.iter().filter(|f| f.required).collect();
-    let total = required_files.len() as u32;
-
-    // Ensure mods/ directory exists
-    let _ = wings
-        .post_servers_server_files_create_directory(
-            server_uuid,
-            &wings_api::servers_server_files_create_directory::post::RequestBody {
-                root: "/".into(),
-                name: "mods".into(),
-            },
-        )
-        .await;
-
-    let mut downloaded = 0u32;
-    let mut client_only_skipped = 0u32;
-
-    for cf_file in &required_files {
-        // Fetch file info from CurseForge API
-        let file_url = format!(
-            "https://api.curseforge.com/v1/mods/{}/files/{}",
-            cf_file.project_id, cf_file.file_id
-        );
-        let file_resp = http_client
-            .get(&file_url)
-            .header("x-api-key", &cf_api_key)
-            .header("Accept", "application/json")
-            .send()
-            .await
-            .map_err(|e| format!("Failed to fetch file info for project {}: {e}", cf_file.project_id))?;
-
-        if !file_resp.status().is_success() {
-            tracing::warn!("CurseForge API returned {} for project {} file {}", file_resp.status(), cf_file.project_id, cf_file.file_id);
-            continue;
-        }
-
-        let file_data: serde_json::Value = file_resp.json().await
-            .map_err(|e| format!("Failed to parse file info: {e}"))?;
-
-        let file_info = &file_data["data"];
-        let filename = file_info["fileName"].as_str().unwrap_or("unknown.jar");
-        let download_url = file_info["downloadUrl"].as_str();
-
-        // Check if file is a mod (goes to mods/) based on path heuristic
-        let is_mod = filename.ends_with(".jar");
-
-        // Check client-only by filename pattern
-        if is_mod && modpack::is_known_client_only(filename, &exclusion_list) {
-            tracing::info!("Skipping known client-only mod: {}", filename);
-            client_only_skipped += 1;
-            continue;
-        }
-
-        // Check client-only via CurseForge project metadata
-        if is_mod {
-            let proj_url = format!("https://api.curseforge.com/v1/mods/{}", cf_file.project_id);
-            if let Ok(proj_resp) = http_client
-                .get(&proj_url)
-                .header("x-api-key", &cf_api_key)
-                .header("Accept", "application/json")
-                .send()
-                .await
-            {
-                if let Ok(_proj_data) = proj_resp.json::<serde_json::Value>().await {
-                    // CurseForge classId 6 = mods, check if it's a client-side mod
-                    // We can't reliably determine this from CF API alone, so rely on
-                    // Modrinth cross-check and filename patterns. The post-install JAR
-                    // scan will catch remaining client-only mods.
-                }
-            }
-        }
-
-        update_progress("downloading_mods", downloaded, total, filename).await;
-
-        let Some(url) = download_url else {
-            // Mod author disabled third-party distribution
-            tracing::warn!("No download URL for {} (project {}), skipping", filename, cf_file.project_id);
-            continue;
-        };
-
-        // Download the file
-        pull_file_with_retry(
-            &wings,
-            server_uuid,
-            &wings_api::servers_server_files_pull::post::RequestBody {
-                root: "/mods".into(),
-                url: url.into(),
-                file_name: Some(filename.into()),
-                use_header: false,
-                foreground: true,
-            },
-            &format!("Failed to download {filename}"),
-        )
-        .await?;
-
-        downloaded += 1;
-    }
-
-    tracing::info!("Downloaded {downloaded} mods, skipped {client_only_skipped} client-only");
-
-    // Step 7: Install loader
-    update_progress("installing_loader", downloaded, total, "Installing server loader...").await;
-
-    let mc_version = &manifest.minecraft.version;
-    let loader_jar = resolve_loader_jar(
-        &{
-            let mut deps = std::collections::HashMap::new();
-            if let Some(loader_id) = manifest.primary_loader() {
-                if let Some(ver) = loader_id.strip_prefix("forge-") {
-                    deps.insert("forge".to_string(), ver.to_string());
-                } else if let Some(ver) = loader_id.strip_prefix("neoforge-") {
-                    deps.insert("neoforge".to_string(), ver.to_string());
-                } else if let Some(ver) = loader_id.strip_prefix("fabric-") {
-                    deps.insert("fabric-loader".to_string(), ver.to_string());
-                } else if let Some(ver) = loader_id.strip_prefix("quilt-") {
-                    deps.insert("quilt-loader".to_string(), ver.to_string());
-                }
-            }
-            deps
-        },
-        mc_version,
-    )
-    .await;
-
-    if let Some(jar) = &loader_jar {
-        if jar.is_zip {
-            pull_file_with_retry(
-                &wings,
-                server_uuid,
-                &wings_api::servers_server_files_pull::post::RequestBody {
-                    root: "/".into(),
-                    url: jar.url.clone().into(),
-                    file_name: Some("_loader_install.zip".into()),
-                    use_header: false,
-                    foreground: true,
-                },
-                "Failed to download loader",
-            )
-            .await?;
-
-            let _ = wings
-                .post_servers_server_files_decompress(
-                    server_uuid,
-                    &wings_api::servers_server_files_decompress::post::RequestBody {
-                        root: "/".into(),
-                        file: "_loader_install.zip".into(),
-                        foreground: true,
-                    },
-                )
-                .await;
-
-            let _ = wings
-                .post_servers_server_files_delete(
-                    server_uuid,
-                    &wings_api::servers_server_files_delete::post::RequestBody {
-                        root: "/".into(),
-                        files: vec!["_loader_install.zip".into()],
-                    },
-                )
-                .await;
-        } else {
-            pull_file_with_retry(
-                &wings,
-                server_uuid,
-                &wings_api::servers_server_files_pull::post::RequestBody {
-                    root: "/".into(),
-                    url: jar.url.clone().into(),
-                    file_name: Some("server.jar".into()),
-                    use_header: false,
-                    foreground: true,
-                },
-                "Failed to download loader jar",
-            )
-            .await?;
-        }
-    }
-
-    // Step 8: Post-install JAR scan for client-only mods
-    update_progress("installing_loader", downloaded, total, "Scanning for client-only mods...").await;
-
-    let mods_entries = list_directory_names(&wings, server_uuid, "/mods", true).await?;
-
-    let mut jars_to_remove: Vec<String> = Vec::new();
-    for entry_name in &mods_entries {
-        if !entry_name.ends_with(".jar") { continue; }
-
-        if modpack::is_known_client_only(entry_name.as_str(), &exclusion_list) {
-            tracing::info!("Removing known client-only mod (post-scan): {entry_name}");
-            jars_to_remove.push(entry_name.to_string());
-            continue;
-        }
-
-        if let Ok(mut file_data) = wings
-            .get_servers_server_files_contents(server_uuid, &q_contents(&format!("/mods/{entry_name}"), true, 50_000_000))
-            .await
-        {
-            let mut bytes = Vec::new();
-            if tokio::io::AsyncReadExt::read_to_end(&mut file_data, &mut bytes).await.is_ok() {
-                if modpack::is_client_only_jar(&bytes) {
-                    tracing::info!("Removing client-only mod (JAR metadata): {entry_name}");
-                    jars_to_remove.push(entry_name.to_string());
-                }
-            }
-        }
-    }
-
-    if !jars_to_remove.is_empty() {
-        tracing::info!("Removing {} client-only mods from post-scan", jars_to_remove.len());
-        let _ = wings
-            .post_servers_server_files_delete(
-                server_uuid,
-                &wings_api::servers_server_files_delete::post::RequestBody {
-                    root: "/mods".into(),
-                    files: jars_to_remove.iter().map(|s| compact_str::CompactString::from(s.as_str())).collect(),
-                },
-            )
-            .await;
-    }
-
-    // Step 9: Write eula.txt
-    let _ = wings
-        .post_servers_server_files_write(server_uuid, body_bytes("eula=true\n".to_string()), &q_write("/eula.txt", user_uuid))
-        .await;
-
-    // Step 10: Write .mcvc-type.json marker
-    {
-        let marker = serde_json::json!({
-            "type": manifest.loader_type(),
-            "version": mc_version,
-            "modpack": manifest.name,
-            "source": "curseforge",
-            "installedAt": chrono::Utc::now().to_rfc3339(),
-        });
-        let _ = wings
-            .post_servers_server_files_write(
-                server_uuid,
-                body_bytes(serde_json::to_string(&marker).unwrap_or_default()),
-                &q_write("/.mcvc-type.json", user_uuid),
-            )
-            .await;
-    }
-
-    // Step 11: Clean up
-    update_progress("done", downloaded, total, "Cleaning up...").await;
-    let _ = wings
-        .post_servers_server_files_delete(
-            server_uuid,
-            &wings_api::servers_server_files_delete::post::RequestBody {
-                root: "/".into(),
-                files: vec!["_cf_temp".into(), "_cf_modpack.zip".into()],
-            },
-        )
-        .await;
-
-    {
-        let mut map = progress_map.lock().await;
-        if let Some(prog) = map.get_mut(&server_uuid) {
-            prog.state = "done".to_string();
-            prog.downloaded_files = downloaded;
-            prog.current_file = String::new();
-        }
-    }
-
-    Ok(())
-}
-
-/// GET: Check modpack installation progress
-async fn modpack_status(
-    server: GetServer,
-    progress_map: modpack::ProgressMap,
-) -> Result<impl IntoResponse, (StatusCode, String)> {
-    let map = progress_map.lock().await;
-    if let Some(progress) = map.get(&server.uuid) {
-        Ok(axum::Json(serde_json::to_value(progress).unwrap()))
-    } else {
-        Ok(axum::Json(serde_json::json!({ "state": "idle" })))
-    }
 }

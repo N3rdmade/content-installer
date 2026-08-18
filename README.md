@@ -21,7 +21,7 @@ Powered by [Modrinth](https://modrinth.com) and [CurseForge](https://www.cursefo
 - Full CurseForge modpack install support with `manifest.json` parsing and per-file API resolution
 - Client-only mod filtering via filename patterns, Modrinth metadata lookup, and JAR metadata inspection
 - Clean install option (wipes server files before installing)
-- Real-time progress tracking with file-by-file status
+- Modpack installs run through the panel's native Wings install flow: the server locks into an `INSTALLING` state, the install script streams logs to the console, and progress/cancellation are handled by the panel
 
 ### Manage
 - View all installed plugins/mods/datapacks with Modrinth identification via file hashing
@@ -77,8 +77,8 @@ Automatically detects your server type and Minecraft version using a determinist
 │   └── src/
 │       ├── lib.rs             # Route registration, install/remove/modpack handlers
 │       ├── curseforge.rs      # CurseForge API proxy endpoints
+│       ├── install_script.rs  # Wings install scripts (python installers, embedded)
 │       ├── settings.rs        # Extension settings (CurseForge API key)
-│       └── modpack.rs         # Modpack types, progress tracking, client-only detection
 ├── frontend/
 │   └── src/
 │       ├── index.ts           # Extension entry point + route registration
@@ -101,7 +101,6 @@ Automatically detects your server type and Minecraft version using a determinist
 - `POST .../remove` - Remove a file
 - `POST .../modpack/install` - Install a Modrinth modpack (.mrpack)
 - `POST .../modpack/cf-install` - Install a CurseForge modpack
-- `GET .../modpack/status` - Check modpack install progress
 - `GET .../curseforge/search` - Proxy CurseForge search
 - `GET .../curseforge/files` - Proxy CurseForge file listing
 - `GET .../curseforge/description` - Proxy CurseForge mod description
