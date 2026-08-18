@@ -7,12 +7,19 @@ import SegmentedControl from '@/elements/SegmentedControl.tsx';
 import Text from '@/elements/Text.tsx';
 import Title from '@/elements/Title.tsx';
 import Select from '@/elements/input/Select.tsx';
-import { useEffect, useState } from 'react';
+import ConfirmationModal from '@/elements/modals/ConfirmationModal.tsx';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import ServerContentContainer from '@/elements/containers/ServerContentContainer.tsx';
+import { useToast } from '@/providers/ToastProvider.tsx';
 import { useServerStore } from '@/stores/server.ts';
 import BrowseTab from './BrowseTab.tsx';
 import ManageTab from './ManageTab.tsx';
 import ModpacksTab from './ModpacksTab.tsx';
+import ModpackInstallStatus, {
+  IDLE_MODPACK_PROGRESS,
+  isModpackInstallActive,
+  type ModpackProgress,
+} from './ModpackInstallStatus.tsx';
 import { detectServer, getAvailableTabs, type ServerDetection } from './detect.ts';
 
 type MainTab = 'browse' | 'manage' | 'modpacks';
@@ -25,6 +32,7 @@ const TAB_LABELS: Record<ContentTab, string> = {
 };
 
 export default function ContentInstallerPage() {
+  const { addToast } = useToast();
   const { server } = useServerStore();
 
   const [detection, setDetection] = useState<ServerDetection | null>(null);
@@ -34,6 +42,102 @@ export default function ContentInstallerPage() {
   const [manageRefreshKey, setManageRefreshKey] = useState(0);
   const [availableTabs, setAvailableTabs] = useState<ContentTab[]>(['plugins', 'mods', 'datapacks']);
   const [selectedWorld, setSelectedWorld] = useState<string>('world');
+  const [modpackProgress, setModpackProgress] = useState<ModpackProgress>(IDLE_MODPACK_PROGRESS);
+  const [confirmCancel, setConfirmCancel] = useState(false);
+  const [cancelling, setCancelling] = useState(false);
+  const [dismissing, setDismissing] = useState(false);
+  const previousModpackState = useRef<string | null>(null);
+  const statusRequestSequence = useRef(0);
+  const modpackInstallActive = isModpackInstallActive(modpackProgress);
+
+  const modpackStatusUrl = `/api/client/servers/${server.uuid}/content-installer/modpack/status`;
+
+  const refreshModpackProgress = useCallback(async (): Promise<ModpackProgress> => {
+    const requestSequence = ++statusRequestSequence.current;
+    const response = await fetch(modpackStatusUrl);
+    if (!response.ok) throw new Error(await response.text() || `Status request failed: ${response.status}`);
+    const next = await response.json() as ModpackProgress;
+    if (requestSequence === statusRequestSequence.current) setModpackProgress(next);
+    return next;
+  }, [modpackStatusUrl]);
+
+  useEffect(() => {
+    statusRequestSequence.current += 1;
+    previousModpackState.current = null;
+    setModpackProgress(IDLE_MODPACK_PROGRESS);
+    setConfirmCancel(false);
+  }, [server.uuid]);
+
+  // Reattach to an existing backend job immediately on mount. Keep a slow idle
+  // poll so another browser tab can start a job, then poll actively while work
+  // is running. Switching into the active cadence restarts this loop at once.
+  useEffect(() => {
+    let stopped = false;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+
+    const poll = async () => {
+      let delay = 30_000;
+      try {
+        const next = await refreshModpackProgress();
+        delay = isModpackInstallActive(next) ? 5_000 : 30_000;
+      } catch {
+        delay = 15_000;
+      }
+
+      if (!stopped) timer = setTimeout(poll, delay);
+    };
+
+    poll();
+    return () => {
+      stopped = true;
+      if (timer) clearTimeout(timer);
+    };
+  }, [refreshModpackProgress, modpackInstallActive]);
+
+  useEffect(() => {
+    const previous = previousModpackState.current;
+    if (previous && isModpackInstallActive({ state: previous })) {
+      if (modpackProgress.state === 'done') {
+        addToast(`${modpackProgress.modpack_name ?? 'Modpack'} installed successfully!`, 'success');
+      } else if (modpackProgress.state === 'error') {
+        addToast(`Modpack installation failed: ${modpackProgress.error ?? 'unknown error'}`, 'error');
+      } else if (modpackProgress.state === 'cancelled') {
+        addToast('Modpack installation cancelled.', 'success');
+      }
+    }
+    previousModpackState.current = modpackProgress.state;
+  }, [modpackProgress.state, modpackProgress.error, modpackProgress.modpack_name]);
+
+  const cancelModpackInstall = async () => {
+    setCancelling(true);
+    try {
+      const response = await fetch(
+        `/api/client/servers/${server.uuid}/content-installer/modpack/cancel`,
+        { method: 'POST' },
+      );
+      if (!response.ok) throw new Error(await response.text() || `Cancel failed: ${response.status}`);
+      await refreshModpackProgress();
+      setConfirmCancel(false);
+    } catch (error) {
+      addToast(`Could not cancel installation: ${error instanceof Error ? error.message : 'unknown error'}`, 'error');
+    } finally {
+      setCancelling(false);
+    }
+  };
+
+  const dismissModpackStatus = async () => {
+    setDismissing(true);
+    try {
+      const response = await fetch(modpackStatusUrl, { method: 'DELETE' });
+      if (!response.ok) throw new Error(await response.text() || `Dismiss failed: ${response.status}`);
+      statusRequestSequence.current += 1;
+      setModpackProgress(IDLE_MODPACK_PROGRESS);
+    } catch (error) {
+      addToast(`Could not dismiss status: ${error instanceof Error ? error.message : 'unknown error'}`, 'error');
+    } finally {
+      setDismissing(false);
+    }
+  };
 
   // Detect server type on mount
   useEffect(() => {
@@ -78,6 +182,14 @@ export default function ContentInstallerPage() {
             {mainTab === 'modpacks' ? 'Modpacks' : TAB_LABELS[contentTab]}
           </Title>
         </div>
+
+        <ModpackInstallStatus
+          progress={modpackProgress}
+          onCancel={() => setConfirmCancel(true)}
+          onDismiss={dismissModpackStatus}
+          cancelling={cancelling}
+          dismissing={dismissing}
+        />
 
         {detecting ? (
           <div className='ci-center'>
@@ -157,10 +269,27 @@ export default function ContentInstallerPage() {
               />
             )}
             {detection && mainTab === 'modpacks' && (
-              <ModpacksTab detection={detection} />
+              <ModpacksTab
+                progress={modpackProgress}
+                refreshProgress={refreshModpackProgress}
+              />
             )}
           </>
         )}
+
+        <ConfirmationModal
+          opened={confirmCancel}
+          onClose={() => setConfirmCancel(false)}
+          title={<Text fw={600}>Cancel modpack installation?</Text>}
+          confirm='Cancel installation'
+          confirmColor='red'
+          onConfirmed={cancelModpackInstall}
+        >
+          <Text size='sm'>
+            This stops any remaining installation work and removes temporary files. Files already downloaded,
+            replaced, or deleted by a clean install will not be restored.
+          </Text>
+        </ConfirmationModal>
       </div>
     </ServerContentContainer>
   );

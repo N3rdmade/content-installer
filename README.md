@@ -21,7 +21,9 @@ Powered by [Modrinth](https://modrinth.com) and [CurseForge](https://www.cursefo
 - Full CurseForge modpack install support with `manifest.json` parsing and per-file API resolution
 - Client-only mod filtering via filename patterns, Modrinth metadata lookup, and JAR metadata inspection
 - Clean install option (wipes server files before installing)
-- Real-time progress tracking with file-by-file status
+- Refresh-safe background progress tracking with file-by-file status
+- Cancel active installations and dismiss completed, failed, or cancelled jobs
+- Prevents overlapping modpack installs on the same server
 
 ### Manage
 - View all installed plugins/mods/datapacks with Modrinth identification via file hashing
@@ -89,6 +91,7 @@ Automatically detects your server type and Minecraft version using a determinist
 │       ├── ContentInstallerPage.tsx  # Main page with tab routing
 │       ├── BrowseTab.tsx      # Search + install from Modrinth/CurseForge
 │       ├── ModpacksTab.tsx    # Modpack browser + installer
+│       ├── ModpackInstallStatus.tsx # Refresh-safe progress and job controls
 │       ├── ManageTab.tsx      # View + remove + update installed content
 │       └── app.css            # Styling
 ```
@@ -102,6 +105,8 @@ Automatically detects your server type and Minecraft version using a determinist
 - `POST .../modpack/install` - Install a Modrinth modpack (.mrpack)
 - `POST .../modpack/cf-install` - Install a CurseForge modpack
 - `GET .../modpack/status` - Check modpack install progress
+- `POST .../modpack/cancel` - Cancel the active modpack install
+- `DELETE .../modpack/status` - Dismiss a terminal install status
 - `GET .../curseforge/search` - Proxy CurseForge search
 - `GET .../curseforge/files` - Proxy CurseForge file listing
 - `GET .../curseforge/description` - Proxy CurseForge mod description

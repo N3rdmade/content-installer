@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, watch};
 
 // ─── Mrpack Index Types ──────────────────────────────────────
 
@@ -78,30 +78,80 @@ pub fn validate_path(path: &str) -> bool {
 
 #[derive(Clone, Serialize)]
 pub struct ModpackProgress {
-    pub state: String,        // "preparing", "downloading_mods", "applying_overrides", "installing_loader", "done", "error"
+    pub job_id: uuid::Uuid,
+    pub state: String,
     pub total_files: u32,
     pub downloaded_files: u32,
     pub current_file: String,
     pub error: Option<String>,
+    pub modpack_name: String,
+    pub version_name: String,
+    pub source: String,
+    pub started_at: String,
+    pub updated_at: String,
 }
 
-impl Default for ModpackProgress {
-    fn default() -> Self {
+impl ModpackProgress {
+    pub fn new(modpack_name: String, version_name: String, source: &str) -> Self {
+        let now = chrono::Utc::now().to_rfc3339();
         Self {
+            job_id: uuid::Uuid::new_v4(),
             state: "preparing".to_string(),
             total_files: 0,
             downloaded_files: 0,
-            current_file: String::new(),
+            current_file: "Starting installation...".to_string(),
             error: None,
+            modpack_name,
+            version_name,
+            source: source.to_string(),
+            started_at: now.clone(),
+            updated_at: now,
         }
+    }
+
+    pub fn is_active(&self) -> bool {
+        is_active_state(&self.state)
     }
 }
 
+pub fn is_active_state(state: &str) -> bool {
+    matches!(
+        state,
+        "preparing"
+            | "downloading_mods"
+            | "applying_overrides"
+            | "installing_loader"
+            | "finalizing"
+            | "cancelling"
+    )
+}
+
+pub struct ModpackJob {
+    pub progress: ModpackProgress,
+    pub cancel: watch::Sender<bool>,
+}
+
 /// Global progress tracker keyed by server UUID
-pub type ProgressMap = Arc<Mutex<HashMap<uuid::Uuid, ModpackProgress>>>;
+pub type ProgressMap = Arc<Mutex<HashMap<uuid::Uuid, ModpackJob>>>;
 
 pub fn create_progress_map() -> ProgressMap {
     Arc::new(Mutex::new(HashMap::new()))
+}
+
+pub fn validate_modrinth_mrpack_url(value: &str) -> bool {
+    url::Url::parse(value).is_ok_and(|url| {
+        url.scheme() == "https" && url.host_str() == Some("cdn.modrinth.com")
+    })
+}
+
+pub fn validate_curseforge_download_url(value: &str) -> bool {
+    url::Url::parse(value).is_ok_and(|url| {
+        url.scheme() == "https"
+            && matches!(
+                url.host_str(),
+                Some("edge.forgecdn.net" | "mediafilez.forgecdn.net" | "media.forgecdn.net")
+            )
+    })
 }
 
 // A large pack can trigger transient CDN or Wings gateway limits even though
@@ -397,7 +447,10 @@ const ALLOWED_MRPACK_DOMAINS: &[&str] = &[
 pub fn validate_download_url(url: &str) -> bool {
     if let Ok(parsed) = url::Url::parse(url) {
         if let Some(host) = parsed.host_str() {
-            return ALLOWED_MRPACK_DOMAINS.iter().any(|d| host == *d || host.ends_with(&format!(".{d}")));
+            return parsed.scheme() == "https"
+                && ALLOWED_MRPACK_DOMAINS
+                    .iter()
+                    .any(|d| host == *d || host.ends_with(&format!(".{d}")));
         }
     }
     false
@@ -485,5 +538,53 @@ mod tests {
         assert_eq!(pull_retry_delay_seconds("429", 4), 120);
         assert_eq!(pull_retry_delay_seconds("503", 1), 2);
         assert_eq!(pull_retry_delay_seconds("503", 4), 16);
+    }
+
+    #[test]
+    fn active_install_states_exclude_terminal_states() {
+        for state in [
+            "preparing",
+            "downloading_mods",
+            "applying_overrides",
+            "installing_loader",
+            "finalizing",
+            "cancelling",
+        ] {
+            assert!(is_active_state(state), "{state} should be active");
+        }
+
+        for state in ["idle", "done", "error", "cancelled"] {
+            assert!(!is_active_state(state), "{state} should be terminal");
+        }
+    }
+
+    #[test]
+    fn top_level_download_urls_require_exact_https_hosts() {
+        assert!(validate_modrinth_mrpack_url(
+            "https://cdn.modrinth.com/data/example/versions/1/pack.mrpack"
+        ));
+        assert!(!validate_modrinth_mrpack_url(
+            "https://cdn.modrinth.com.evil.example/pack.mrpack"
+        ));
+        assert!(!validate_modrinth_mrpack_url(
+            "http://cdn.modrinth.com/pack.mrpack"
+        ));
+
+        assert!(validate_curseforge_download_url(
+            "https://edge.forgecdn.net/files/1234/pack.zip"
+        ));
+        assert!(validate_curseforge_download_url(
+            "https://mediafilez.forgecdn.net/files/1234/pack.zip"
+        ));
+        assert!(!validate_curseforge_download_url(
+            "https://edge.forgecdn.net.evil.example/pack.zip"
+        ));
+
+        assert!(validate_download_url(
+            "https://cdn.modrinth.com/data/example/mod.jar"
+        ));
+        assert!(!validate_download_url(
+            "http://cdn.modrinth.com/data/example/mod.jar"
+        ));
     }
 }

@@ -1,5 +1,5 @@
 import { marked } from 'marked';
-import { faArrowDown, faCheck, faExclamationTriangle, faExternalLink, faSearch, faSpinner } from '@fortawesome/free-solid-svg-icons';
+import { faArrowDown, faExclamationTriangle, faExternalLink, faSearch } from '@fortawesome/free-solid-svg-icons';
 import { FontAwesomeIcon } from '@fortawesome/react-fontawesome';
 import { Loader } from '@mantine/core';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
@@ -13,18 +13,16 @@ import Button from '@/elements/Button.tsx';
 import Card from '@/elements/Card.tsx';
 import Checkbox from '@/elements/input/Checkbox.tsx';
 import { Modal } from '@/elements/modals/Modal.tsx';
-import Progress from '@/elements/Progress.tsx';
 import Select from '@/elements/input/Select.tsx';
 import TextInput from '@/elements/input/TextInput.tsx';
 import { useToast } from '@/providers/ToastProvider.tsx';
 import { useServerStore } from '@/stores/server.ts';
-import type { ServerDetection } from './detect.ts';
+import { isModpackInstallActive, type ModpackProgress } from './ModpackInstallStatus.tsx';
 import { versionLabel } from './versions.ts';
 import {
   CF_CLASS_MODPACKS,
   checkCurseForgeStatus,
   formatDownloads as cfFormatDownloads,
-  formatSize as cfFormatSize,
   getCurseForgeDescription,
   getCurseForgeFiles,
   searchCurseForge,
@@ -33,7 +31,6 @@ import {
 } from './curseforge.ts';
 import {
   formatDownloads,
-  formatSize,
   getProject,
   getPrimaryFile,
   getProjectVersions,
@@ -45,7 +42,8 @@ import {
 } from './modrinth.ts';
 
 interface ModpacksTabProps {
-  detection: ServerDetection;
+  progress: ModpackProgress;
+  refreshProgress: () => Promise<ModpackProgress>;
 }
 
 type Source = 'modrinth' | 'curseforge';
@@ -62,31 +60,9 @@ interface DisplayModpack {
   curseforgeProject?: CurseForgeProject;
 }
 
-interface ModpackProgress {
-  state: string;
-  total_files: number;
-  downloaded_files: number;
-  current_file: string;
-  error?: string;
-}
-
-const MODPACK_STATUS_POLL_MS = 5_000;
-const MODPACK_INSTALL_TIMEOUT_MS = 3 * 60 * 60 * 1_000;
-
-function retryAfterMilliseconds(response: Response): number | null {
-  const value = response.headers.get('Retry-After');
-  if (!value) return null;
-
-  const seconds = Number(value);
-  if (Number.isFinite(seconds)) return Math.max(0, seconds * 1_000);
-
-  const date = Date.parse(value);
-  return Number.isNaN(date) ? null : Math.max(0, date - Date.now());
-}
-
 // Content comes from Modrinth/CurseForge project descriptions (trusted API sources)
 
-export default function ModpacksTab({ detection }: ModpacksTabProps) {
+export default function ModpacksTab({ progress, refreshProgress }: ModpacksTabProps) {
   const { addToast } = useToast();
   const { server, state } = useServerStore();
 
@@ -116,11 +92,11 @@ export default function ModpacksTab({ detection }: ModpacksTabProps) {
 
   const [versionsLoading, setVersionsLoading] = useState(false);
   const [installing, setInstalling] = useState(false);
-  const [progress, setProgress] = useState<ModpackProgress | null>(null);
   const [cleanInstall, setCleanInstall] = useState(true);
   const [acceptRisk, setAcceptRisk] = useState(false);
 
   const isRunning = state === 'running' || state === 'starting';
+  const installActive = isModpackInstallActive(progress);
 
   useEffect(() => {
     checkCurseForgeStatus(server.uuid).then(setCfAvailable);
@@ -213,7 +189,6 @@ export default function ModpacksTab({ detection }: ModpacksTabProps) {
     setVersionsLoading(true);
     setDetailLoading(true);
     setDetailBody('');
-    setProgress(null);
     setCleanInstall(true);
     setAcceptRisk(false);
     setModrinthVersions([]);
@@ -299,7 +274,6 @@ export default function ModpacksTab({ detection }: ModpacksTabProps) {
     if (!selectedModpack) return;
 
     setInstalling(true);
-    setProgress({ state: 'preparing', total_files: 0, downloaded_files: 0, current_file: 'Starting...' });
 
     try {
       let endpoint: string;
@@ -313,6 +287,8 @@ export default function ModpacksTab({ detection }: ModpacksTabProps) {
         params = new URLSearchParams({
           mrpack_url: file.url,
           clean_install: String(cleanInstall),
+          modpack_name: selectedModpack.title,
+          version_name: selectedModrinthVersion.version_number,
         });
       } else {
         if (!selectedCfFile) return;
@@ -324,66 +300,26 @@ export default function ModpacksTab({ detection }: ModpacksTabProps) {
         params = new URLSearchParams({
           zip_url: selectedCfFile.downloadUrl,
           clean_install: String(cleanInstall),
+          modpack_name: selectedModpack.title,
+          version_name: selectedCfFile.displayName,
         });
       }
 
       const res = await fetch(`${endpoint}?${params}`, { method: 'POST' });
       if (!res.ok) throw new Error(await res.text() || `Install failed: ${res.status}`);
-
-      // Large packs can take well over 15 minutes. Poll slowly enough to stay
-      // below the panel-wide client API rate limit and keep going until the
-      // backend reports a terminal state.
-      const statusUrl = `/api/client/servers/${server.uuid}/content-installer/modpack/status`;
-      const deadline = Date.now() + MODPACK_INSTALL_TIMEOUT_MS;
-      let consecutiveStatusFailures = 0;
-      let completed = false;
-
-      while (Date.now() < deadline) {
-        await new Promise((r) => setTimeout(r, MODPACK_STATUS_POLL_MS));
-        const statusRes = await fetch(statusUrl);
-        if (statusRes.status === 429) {
-          const retryAfter = retryAfterMilliseconds(statusRes) ?? 15_000;
-          await new Promise((r) => setTimeout(r, retryAfter));
-          continue;
-        }
-        if (!statusRes.ok) {
-          consecutiveStatusFailures += 1;
-          if (consecutiveStatusFailures >= 12) {
-            throw new Error(`Lost install status: HTTP ${statusRes.status}`);
-          }
-          continue;
-        }
-
-        consecutiveStatusFailures = 0;
-        const status: ModpackProgress = await statusRes.json();
-        setProgress(status);
-
-        if (status.state === 'done') {
-          addToast(`Modpack "${selectedModpack.title}" installed successfully!`, 'success');
-          completed = true;
-          break;
-        }
-        if (status.state === 'error') {
-          throw new Error(status.error ?? 'Installation failed');
-        }
-      }
-
-      if (!completed) {
-        throw new Error('Installation did not finish within 3 hours');
-      }
+      addToast(`Installing "${selectedModpack.title}" in the background.`, 'success');
+      setSelectedModpack(null);
+      await refreshProgress().catch(() => undefined);
     } catch (err) {
-      addToast(`Modpack install failed: ${err instanceof Error ? err.message : 'unknown'}`, 'error');
-      setProgress((p) => p ? { ...p, state: 'error', error: err instanceof Error ? err.message : 'unknown' } : null);
+      addToast(`Could not start modpack install: ${err instanceof Error ? err.message : 'unknown'}`, 'error');
+      await refreshProgress().catch(() => undefined);
     } finally {
       setInstalling(false);
     }
-  }, [selectedModpack, selectedModrinthVersion, selectedCfFile, cleanInstall, server.uuid]);
+  }, [selectedModpack, selectedModrinthVersion, selectedCfFile, cleanInstall, server.uuid, refreshProgress]);
 
   const selectedFile = selectedModpack?.source === 'modrinth' && selectedModrinthVersion
     ? getPrimaryFile(selectedModrinthVersion) : null;
-  const progressPct = progress && progress.total_files > 0
-    ? Math.round((progress.downloaded_files / progress.total_files) * 100) : 0;
-
   const sourceOptions = [
     { value: 'modrinth', label: 'Modrinth' },
     ...(cfAvailable ? [{ value: 'curseforge', label: 'CurseForge' }] : []),
@@ -511,7 +447,7 @@ export default function ModpacksTab({ detection }: ModpacksTabProps) {
                         leftSection={<FontAwesomeIcon icon={faExternalLink} />}
                         onClick={(e: React.MouseEvent) => {
                           e.stopPropagation();
-                          window.open(`https://modrinth.com/modpack/${selectedModpack.modrinthProject!.slug}`, '_blank', 'noopener');
+                          window.open(`https://modrinth.com/modpack/${selectedModpack.modrinthProject?.slug}`, '_blank', 'noopener');
                         }}>View</Button>
                     )}
                     {selectedModpack.source === 'curseforge' && selectedModpack.curseforgeProject && (
@@ -519,7 +455,7 @@ export default function ModpacksTab({ detection }: ModpacksTabProps) {
                         leftSection={<FontAwesomeIcon icon={faExternalLink} />}
                         onClick={(e: React.MouseEvent) => {
                           e.stopPropagation();
-                          window.open(`https://www.curseforge.com/minecraft/modpacks/${selectedModpack.curseforgeProject!.slug}`, '_blank', 'noopener');
+                          window.open(`https://www.curseforge.com/minecraft/modpacks/${selectedModpack.curseforgeProject?.slug}`, '_blank', 'noopener');
                         }}>View</Button>
                     )}
                   </Group>
@@ -577,6 +513,12 @@ export default function ModpacksTab({ detection }: ModpacksTabProps) {
               </Alert>
             )}
 
+            {installActive && (
+              <Alert icon={<FontAwesomeIcon icon={faExclamationTriangle} />} color='yellow' variant='light'>
+                Another modpack installation is already active for this server. Its progress is shown above.
+              </Alert>
+            )}
+
             {selectedModpack.source === 'curseforge' && selectedCfFile && !selectedCfFile.downloadUrl && (
               <Alert color='red' variant='light'>
                 This modpack does not allow third-party downloads.
@@ -608,74 +550,30 @@ export default function ModpacksTab({ detection }: ModpacksTabProps) {
                   checked={cleanInstall}
                   onChange={(e) => setCleanInstall(e.currentTarget.checked)}
                   color='red'
-                  disabled={installing || isRunning}
+                  disabled={installing || installActive || isRunning}
                 />
                 <Group justify='space-between' align='center' wrap='wrap'>
                   <Checkbox
                     label='I understand this will replace my server files'
                     checked={acceptRisk}
                     onChange={(e) => setAcceptRisk(e.currentTarget.checked)}
-                    disabled={installing || isRunning}
+                    disabled={installing || installActive || isRunning}
                   />
                   <Group gap='sm'>
-                    {progress?.state !== 'done' && (
-                      <Button
-                        onClick={doInstall}
-                        loading={installing}
-                        disabled={isRunning || !canInstall || !acceptRisk || !hasVersions}
-                        color='red'
-                        leftSection={<FontAwesomeIcon icon={faArrowDown} />}
-                      >
-                        Install Modpack
-                      </Button>
-                    )}
+                    <Button
+                      onClick={doInstall}
+                      loading={installing}
+                      disabled={installActive || isRunning || !canInstall || !acceptRisk || !hasVersions}
+                      color='red'
+                      leftSection={<FontAwesomeIcon icon={faArrowDown} />}
+                    >
+                      Install Modpack
+                    </Button>
                   </Group>
                 </Group>
               </>
             )}
 
-            {/* Progress */}
-            {progress && progress.state !== 'idle' && (
-              <Card p='sm' className='ci-version-info'>
-                <Group gap='xs' mb='xs'>
-                  {progress.state === 'done' ? (
-                    <FontAwesomeIcon icon={faCheck} color='#4ade80' />
-                  ) : progress.state === 'error' ? (
-                    <FontAwesomeIcon icon={faExclamationTriangle} color='#ef4444' />
-                  ) : (
-                    <FontAwesomeIcon icon={faSpinner} spin />
-                  )}
-                  <Text size='sm' fw={500}>
-                    {progress.state === 'preparing' && 'Preparing...'}
-                    {progress.state === 'downloading_mods' && `Downloading mods (${progress.downloaded_files}/${progress.total_files})`}
-                    {progress.state === 'applying_overrides' && 'Applying configs...'}
-                    {progress.state === 'installing_loader' && 'Installing loader...'}
-                    {progress.state === 'done' && 'Installation complete!'}
-                    {progress.state === 'error' && 'Installation failed'}
-                  </Text>
-                </Group>
-                {progress.state === 'downloading_mods' && progress.total_files > 0 && (
-                  <Progress value={progressPct} hourglass={false} className='mb-2' />
-                )}
-                {progress.current_file && progress.state !== 'done' && (
-                  <Text size='xs' c='dimmed'>{progress.current_file}</Text>
-                )}
-                {progress.error && (
-                  <Text size='xs' c='red' mt='xs'>{progress.error}</Text>
-                )}
-                {progress.state === 'done' && (
-                  <Group justify='flex-end' mt='xs'>
-                    <Button
-                      onClick={() => setSelectedModpack(null)}
-                      color='green'
-                      leftSection={<FontAwesomeIcon icon={faCheck} />}
-                    >
-                      Done
-                    </Button>
-                  </Group>
-                )}
-              </Card>
-            )}
           </Stack>
         )}
       </Modal>

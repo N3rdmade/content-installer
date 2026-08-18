@@ -223,8 +223,26 @@ impl Extension for ExtensionStruct {
                     )
                     .route(
                         "/content-installer/modpack/status",
-                        axum::routing::get(move |server| {
-                            modpack_status(server, ps.clone())
+                        axum::routing::get({
+                            let ps_status = ps.clone();
+                            move |permissions, server| {
+                                modpack_status(permissions, server, ps_status.clone())
+                            }
+                        }),
+                    )
+                    .route(
+                        "/content-installer/modpack/cancel",
+                        axum::routing::post({
+                            let pi = pi.clone();
+                            move |permissions, server| {
+                                cancel_modpack_install(permissions, server, pi.clone())
+                            }
+                        }),
+                    )
+                    .route(
+                        "/content-installer/modpack/status",
+                        axum::routing::delete(move |permissions, server| {
+                            clear_modpack_status(permissions, server, ps.clone())
                         }),
                     )
             })
@@ -518,6 +536,39 @@ async fn remove_content(
 
 // ─── Modpack Installation ────────────────────────────────────
 
+async fn cleanup_modpack_files(
+    wings: &wings_api::client::WingsClient,
+    server_uuid: uuid::Uuid,
+    files: Vec<compact_str::CompactString>,
+) {
+    let request = wings_api::servers_server_files_delete::post::RequestBody {
+        root: "/".into(),
+        files,
+    };
+    let cleanup = wings.post_servers_server_files_delete(server_uuid, &request);
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(30), cleanup).await;
+}
+
+async fn finish_modpack_job(
+    progress_map: &modpack::ProgressMap,
+    server_uuid: uuid::Uuid,
+    job_id: uuid::Uuid,
+    state: &str,
+    error: Option<String>,
+) {
+    let mut map = progress_map.lock().await;
+    if let Some(job) = map.get_mut(&server_uuid) {
+        if job.progress.job_id != job_id {
+            return;
+        }
+        job.progress.state = state.to_string();
+        job.progress.current_file = String::new();
+        job.progress.error = error;
+        job.progress.updated_at = chrono::Utc::now().to_rfc3339();
+        tracing::info!(%server_uuid, %job_id, state, "modpack installation reached terminal state");
+    }
+}
+
 #[derive(Deserialize)]
 struct ModpackInstallParams {
     /// URL to the .mrpack file on cdn.modrinth.com
@@ -525,6 +576,15 @@ struct ModpackInstallParams {
     /// Whether to wipe the server first
     #[serde(default)]
     clean_install: bool,
+    #[serde(default)]
+    modpack_name: Option<String>,
+    #[serde(default)]
+    version_name: Option<String>,
+}
+
+fn progress_label(value: Option<&str>, fallback: &str) -> String {
+    let value = value.map(str::trim).filter(|value| !value.is_empty()).unwrap_or(fallback);
+    value.chars().take(160).collect()
 }
 
 /// POST: Install a modpack from an mrpack URL
@@ -541,14 +601,8 @@ async fn modpack_install(
         .map_err(|_| err(StatusCode::FORBIDDEN, "Missing files.create permission"))?;
 
     // Validate mrpack URL is from Modrinth CDN
-    if !params.mrpack_url.starts_with("https://cdn.modrinth.com/") {
+    if !modpack::validate_modrinth_mrpack_url(&params.mrpack_url) {
         return Err(err(StatusCode::BAD_REQUEST, "mrpack URL must be from cdn.modrinth.com"));
-    }
-
-    // Initialize progress
-    {
-        let mut map = progress_map.lock().await;
-        map.insert(server.uuid, modpack::ModpackProgress::default());
     }
 
     let node = server
@@ -565,20 +619,61 @@ async fn modpack_install(
     let server_uuid = server.uuid;
     let user_uuid = user.uuid;
     let pm = progress_map.clone();
+    let progress = modpack::ModpackProgress::new(
+        progress_label(params.modpack_name.as_deref(), "Modrinth modpack"),
+        progress_label(params.version_name.as_deref(), "Selected version"),
+        "modrinth",
+    );
+    let job_id = progress.job_id;
+    let (cancel, mut cancelled) = tokio::sync::watch::channel(false);
+
+    {
+        let mut map = progress_map.lock().await;
+        if map.get(&server_uuid).is_some_and(|job| job.progress.is_active()) {
+            return Err(err(
+                StatusCode::CONFLICT,
+                "A modpack installation is already active for this server",
+            ));
+        }
+        map.insert(server_uuid, modpack::ModpackJob { progress, cancel });
+    }
 
     // Spawn the installation as a background task
     tokio::spawn(async move {
-        let result = run_modpack_install(wings, server_uuid, user_uuid, params, pm.clone()).await;
-        if let Err(e) = result {
-            let mut map = pm.lock().await;
-            if let Some(prog) = map.get_mut(&server_uuid) {
-                prog.state = "error".to_string();
-                prog.error = Some(e);
+        let result = tokio::select! {
+            biased;
+            _ = cancelled.changed() => None,
+            result = run_modpack_install(&wings, server_uuid, user_uuid, params, pm.clone(), job_id) => Some(result),
+        };
+
+        match result {
+            Some(Ok(())) => {}
+            Some(Err(error)) => {
+                cleanup_modpack_files(
+                    &wings,
+                    server_uuid,
+                    vec![
+                        "_mrpack_temp".into(),
+                        "_mrpack_install.zip".into(),
+                        "_loader_install.zip".into(),
+                    ],
+                )
+                .await;
+                finish_modpack_job(&pm, server_uuid, job_id, "error", Some(error)).await;
+            }
+            None => {
+                cleanup_modpack_files(
+                    &wings,
+                    server_uuid,
+                    vec!["_mrpack_temp".into(), "_mrpack_install.zip".into(), "_loader_install.zip".into()],
+                )
+                .await;
+                finish_modpack_job(&pm, server_uuid, job_id, "cancelled", None).await;
             }
         }
     });
 
-    Ok(axum::Json(serde_json::json!({ "success": true })))
+    Ok(axum::Json(serde_json::json!({ "success": true, "job_id": job_id })))
 }
 
 struct LoaderJar {
@@ -633,11 +728,12 @@ async fn resolve_loader_jar(dependencies: &std::collections::HashMap<String, Str
 
 /// Background task that runs the full modpack installation
 async fn run_modpack_install(
-    wings: wings_api::client::WingsClient,
+    wings: &wings_api::client::WingsClient,
     server_uuid: uuid::Uuid,
     user_uuid: uuid::Uuid,
     params: ModpackInstallParams,
     progress_map: modpack::ProgressMap,
+    job_id: uuid::Uuid,
 ) -> Result<(), String> {
     let update_progress = |state: &str, downloaded: u32, total: u32, current: &str| {
         let pm = progress_map.clone();
@@ -645,11 +741,15 @@ async fn run_modpack_install(
         let current = current.to_string();
         async move {
             let mut map = pm.lock().await;
-            if let Some(prog) = map.get_mut(&server_uuid) {
-                prog.state = state;
-                prog.total_files = total;
-                prog.downloaded_files = downloaded;
-                prog.current_file = current;
+            if let Some(job) = map.get_mut(&server_uuid) {
+                if job.progress.job_id != job_id {
+                    return;
+                }
+                job.progress.state = state;
+                job.progress.total_files = total;
+                job.progress.downloaded_files = downloaded;
+                job.progress.current_file = current;
+                job.progress.updated_at = chrono::Utc::now().to_rfc3339();
             }
         }
     };
@@ -1011,26 +1111,15 @@ async fn run_modpack_install(
     }
 
     // Step 11: Clean up temp files
-    update_progress("done", total, total, "Cleaning up...").await;
-    let _ = wings
-        .post_servers_server_files_delete(
-            server_uuid,
-            &wings_api::servers_server_files_delete::post::RequestBody {
-                root: "/".into(),
-                files: vec!["_mrpack_temp".into(), "_mrpack_install.zip".into()],
-            },
-        )
-        .await;
+    update_progress("finalizing", total, total, "Cleaning up temporary files...").await;
+    cleanup_modpack_files(
+        wings,
+        server_uuid,
+        vec!["_mrpack_temp".into(), "_mrpack_install.zip".into()],
+    )
+    .await;
 
-    // Mark as done
-    {
-        let mut map = progress_map.lock().await;
-        if let Some(prog) = map.get_mut(&server_uuid) {
-            prog.state = "done".to_string();
-            prog.downloaded_files = total;
-            prog.current_file = String::new();
-        }
-    }
+    finish_modpack_job(&progress_map, server_uuid, job_id, "done", None).await;
 
     Ok(())
 }
@@ -1043,6 +1132,10 @@ struct CfModpackInstallParams {
     zip_url: String,
     #[serde(default)]
     clean_install: bool,
+    #[serde(default)]
+    modpack_name: Option<String>,
+    #[serde(default)]
+    version_name: Option<String>,
 }
 
 async fn cf_modpack_install(
@@ -1057,10 +1150,7 @@ async fn cf_modpack_install(
         .has_server_permission("files.create")
         .map_err(|_| err(StatusCode::FORBIDDEN, "Missing files.create permission"))?;
 
-    if !params.zip_url.starts_with("https://edge.forgecdn.net/")
-        && !params.zip_url.starts_with("https://mediafilez.forgecdn.net/")
-        && !params.zip_url.starts_with("https://media.forgecdn.net/")
-    {
+    if !modpack::validate_curseforge_download_url(&params.zip_url) {
         return Err(err(StatusCode::BAD_REQUEST, "URL must be from CurseForge CDN"));
     }
 
@@ -1080,11 +1170,6 @@ async fn cf_modpack_install(
         ext.curseforge_api_key.to_string()
     };
 
-    {
-        let mut map = progress_map.lock().await;
-        map.insert(server.uuid, modpack::ModpackProgress::default());
-    }
-
     let node = server
         .node
         .fetch_cached(&state.database)
@@ -1099,28 +1184,78 @@ async fn cf_modpack_install(
     let server_uuid = server.uuid;
     let user_uuid = user.uuid;
     let pm = progress_map.clone();
+    let progress = modpack::ModpackProgress::new(
+        progress_label(params.modpack_name.as_deref(), "CurseForge modpack"),
+        progress_label(params.version_name.as_deref(), "Selected version"),
+        "curseforge",
+    );
+    let job_id = progress.job_id;
+    let (cancel, mut cancelled) = tokio::sync::watch::channel(false);
+
+    {
+        let mut map = progress_map.lock().await;
+        if map.get(&server_uuid).is_some_and(|job| job.progress.is_active()) {
+            return Err(err(
+                StatusCode::CONFLICT,
+                "A modpack installation is already active for this server",
+            ));
+        }
+        map.insert(server_uuid, modpack::ModpackJob { progress, cancel });
+    }
 
     tokio::spawn(async move {
-        let result = run_cf_modpack_install(wings, server_uuid, user_uuid, params, cf_api_key, pm.clone()).await;
-        if let Err(e) = result {
-            let mut map = pm.lock().await;
-            if let Some(prog) = map.get_mut(&server_uuid) {
-                prog.state = "error".to_string();
-                prog.error = Some(e);
+        let result = tokio::select! {
+            biased;
+            _ = cancelled.changed() => None,
+            result = run_cf_modpack_install(
+                &wings,
+                server_uuid,
+                user_uuid,
+                params,
+                cf_api_key,
+                pm.clone(),
+                job_id,
+            ) => Some(result),
+        };
+
+        match result {
+            Some(Ok(())) => {}
+            Some(Err(error)) => {
+                cleanup_modpack_files(
+                    &wings,
+                    server_uuid,
+                    vec![
+                        "_cf_temp".into(),
+                        "_cf_modpack.zip".into(),
+                        "_loader_install.zip".into(),
+                    ],
+                )
+                .await;
+                finish_modpack_job(&pm, server_uuid, job_id, "error", Some(error)).await;
+            }
+            None => {
+                cleanup_modpack_files(
+                    &wings,
+                    server_uuid,
+                    vec!["_cf_temp".into(), "_cf_modpack.zip".into(), "_loader_install.zip".into()],
+                )
+                .await;
+                finish_modpack_job(&pm, server_uuid, job_id, "cancelled", None).await;
             }
         }
     });
 
-    Ok(axum::Json(serde_json::json!({ "success": true })))
+    Ok(axum::Json(serde_json::json!({ "success": true, "job_id": job_id })))
 }
 
 async fn run_cf_modpack_install(
-    wings: wings_api::client::WingsClient,
+    wings: &wings_api::client::WingsClient,
     server_uuid: uuid::Uuid,
     user_uuid: uuid::Uuid,
     params: CfModpackInstallParams,
     cf_api_key: String,
     progress_map: modpack::ProgressMap,
+    job_id: uuid::Uuid,
 ) -> Result<(), String> {
     let update_progress = |state: &str, downloaded: u32, total: u32, current: &str| {
         let pm = progress_map.clone();
@@ -1128,11 +1263,15 @@ async fn run_cf_modpack_install(
         let current = current.to_string();
         async move {
             let mut map = pm.lock().await;
-            if let Some(prog) = map.get_mut(&server_uuid) {
-                prog.state = state;
-                prog.total_files = total;
-                prog.downloaded_files = downloaded;
-                prog.current_file = current;
+            if let Some(job) = map.get_mut(&server_uuid) {
+                if job.progress.job_id != job_id {
+                    return;
+                }
+                job.progress.state = state;
+                job.progress.total_files = total;
+                job.progress.downloaded_files = downloaded;
+                job.progress.current_file = current;
+                job.progress.updated_at = chrono::Utc::now().to_rfc3339();
             }
         }
     };
@@ -1217,6 +1356,9 @@ async fn run_cf_modpack_install(
 
     // Step 5: Apply overrides
     update_progress("applying_overrides", 0, 0, "Applying config overrides...").await;
+    if !modpack::validate_path(&manifest.overrides) {
+        return Err("CurseForge manifest contains an invalid overrides path".to_string());
+    }
     let overrides_path = format!("/_cf_temp/{}", manifest.overrides);
     let override_entries =
         list_directory_names(&wings, server_uuid, &overrides_path, true).await?;
@@ -1500,38 +1642,86 @@ async fn run_cf_modpack_install(
     }
 
     // Step 11: Clean up
-    update_progress("done", downloaded, total, "Cleaning up...").await;
-    let _ = wings
-        .post_servers_server_files_delete(
-            server_uuid,
-            &wings_api::servers_server_files_delete::post::RequestBody {
-                root: "/".into(),
-                files: vec!["_cf_temp".into(), "_cf_modpack.zip".into()],
-            },
-        )
-        .await;
+    update_progress("finalizing", downloaded, total, "Cleaning up temporary files...").await;
+    cleanup_modpack_files(
+        wings,
+        server_uuid,
+        vec!["_cf_temp".into(), "_cf_modpack.zip".into()],
+    )
+    .await;
 
-    {
-        let mut map = progress_map.lock().await;
-        if let Some(prog) = map.get_mut(&server_uuid) {
-            prog.state = "done".to_string();
-            prog.downloaded_files = downloaded;
-            prog.current_file = String::new();
-        }
-    }
+    finish_modpack_job(&progress_map, server_uuid, job_id, "done", None).await;
 
     Ok(())
 }
 
 /// GET: Check modpack installation progress
 async fn modpack_status(
+    permissions: GetPermissionManager,
     server: GetServer,
     progress_map: modpack::ProgressMap,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
+    permissions
+        .has_server_permission("files.create")
+        .map_err(|_| err(StatusCode::FORBIDDEN, "Missing files.create permission"))?;
+
     let map = progress_map.lock().await;
-    if let Some(progress) = map.get(&server.uuid) {
-        Ok(axum::Json(serde_json::to_value(progress).unwrap()))
+    if let Some(job) = map.get(&server.uuid) {
+        Ok(axum::Json(serde_json::to_value(&job.progress).unwrap()))
     } else {
         Ok(axum::Json(serde_json::json!({ "state": "idle" })))
     }
+}
+
+/// POST: Request cancellation of the active modpack installation.
+async fn cancel_modpack_install(
+    permissions: GetPermissionManager,
+    server: GetServer,
+    progress_map: modpack::ProgressMap,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    permissions
+        .has_server_permission("files.create")
+        .map_err(|_| err(StatusCode::FORBIDDEN, "Missing files.create permission"))?;
+
+    let cancel = {
+        let mut map = progress_map.lock().await;
+        let job = map.get_mut(&server.uuid).ok_or_else(|| {
+            err(StatusCode::CONFLICT, "No modpack installation is active")
+        })?;
+
+        if !job.progress.is_active() {
+            return Err(err(StatusCode::CONFLICT, "No modpack installation is active"));
+        }
+
+        job.progress.state = "cancelling".to_string();
+        job.progress.current_file = "Stopping after the current server operation...".to_string();
+        job.progress.updated_at = chrono::Utc::now().to_rfc3339();
+        job.cancel.clone()
+    };
+
+    let _ = cancel.send(true);
+    tracing::info!(server_uuid = %server.uuid, "modpack installation cancellation requested");
+    Ok(axum::Json(serde_json::json!({ "success": true })))
+}
+
+/// DELETE: Acknowledge and remove a completed, failed, or cancelled status.
+async fn clear_modpack_status(
+    permissions: GetPermissionManager,
+    server: GetServer,
+    progress_map: modpack::ProgressMap,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    permissions
+        .has_server_permission("files.create")
+        .map_err(|_| err(StatusCode::FORBIDDEN, "Missing files.create permission"))?;
+
+    let mut map = progress_map.lock().await;
+    if map.get(&server.uuid).is_some_and(|job| job.progress.is_active()) {
+        return Err(err(
+            StatusCode::CONFLICT,
+            "An active installation cannot be dismissed",
+        ));
+    }
+    map.remove(&server.uuid);
+
+    Ok(axum::Json(serde_json::json!({ "success": true })))
 }
