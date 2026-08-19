@@ -78,7 +78,7 @@ pub fn curseforge_script(
     }
 }
 
-const PYTHON_COMMON: &str = r###"import datetime, hashlib, json, os, re, shutil, sys, time, urllib.request, zipfile
+const PYTHON_COMMON: &str = r###"import datetime, hashlib, json, os, re, shutil, sys, time, tomllib, urllib.request, zipfile
 from pathlib import Path
 
 WORKSPACE = Path("/mnt/server")
@@ -251,73 +251,94 @@ def jar_client_only(jar_path):
                         return True
                 except Exception:  # noqa: BLE001
                     pass
-            for meta in ("META-INF/mods.toml", "META-INF/neoforge.mods.toml"):
-                if meta in names:
-                    lower = z.read(meta).decode("utf-8", "replace").lower()
-                    has_client = 'side="client"' in lower or 'side = "client"' in lower
-                    has_both = 'side="both"' in lower or 'side = "both"' in lower
-                    has_server = 'side="server"' in lower or 'side = "server"' in lower
-                    if has_client and not has_both and not has_server:
-                        return True
-                    if (
-                        'displaytest="ignore_all_version"' in lower
-                        or 'displaytest = "ignore_all_version"' in lower
-                        or 'displaytest="ignore_server_only"' in lower
-                        or 'displaytest = "ignore_server_only"' in lower
-                    ):
-                        return True
+            # Forge/NeoForge `side` values belong to individual dependency
+            # declarations, not to the containing mod. Likewise, displayTest
+            # controls network version compatibility and is not proof that a
+            # mod is client-only. Treating either as an environment marker can
+            # remove perfectly valid server mods, so use the curated filename
+            # list for Forge-family jars instead.
     except Exception:  # noqa: BLE001
         pass
     return False
 
 
-def mod_id(jar_path):
+def mod_ids(jar_path):
     try:
         with zipfile.ZipFile(jar_path) as z:
             names = z.namelist()
             if "fabric.mod.json" in names:
-                return str(
+                value = str(
                     json.loads(z.read("fabric.mod.json").decode("utf-8", "replace")).get("id", "")
                 ).lower()
+                return {value} if value else set()
             if "quilt.mod.json" in names:
-                return str(
+                value = str(
                     json.loads(z.read("quilt.mod.json").decode("utf-8", "replace"))
                     .get("quilt_loader", {})
                     .get("id", "")
                 ).lower()
+                return {value} if value else set()
             for meta in ("META-INF/mods.toml", "META-INF/neoforge.mods.toml"):
                 if meta in names:
                     text = z.read(meta).decode("utf-8", "replace")
-                    for line in text.splitlines():
-                        match = re.match(r'\s*modId\s*=\s*"([^"]+)"', line)
-                        if match:
-                            return match.group(1).lower()
+                    try:
+                        data = tomllib.loads(text)
+                        return {
+                            str(entry.get("modId", "")).lower()
+                            for entry in data.get("mods", [])
+                            if entry.get("modId")
+                        }
+                    except Exception:  # noqa: BLE001
+                        match = re.search(r'(?m)^\s*modId\s*=\s*"([^"]+)"', text)
+                        return {match.group(1).lower()} if match else set()
     except Exception:  # noqa: BLE001
         pass
-    return ""
+    return set()
 
 
-def required_dep_ids(mods_dir):
+def jar_required_dep_ids(jar):
     required = set()
-    for jar in mods_dir.glob("*.jar"):
-        try:
-            with zipfile.ZipFile(jar) as z:
-                names = z.namelist()
-                if "fabric.mod.json" in names:
-                    data = json.loads(z.read("fabric.mod.json").decode("utf-8", "replace"))
-                    for dep in (data.get("depends") or {}):
-                        required.add(str(dep).lower())
-                if "quilt.mod.json" in names:
-                    data = json.loads(z.read("quilt.mod.json").decode("utf-8", "replace"))
-                    for dep in ((data.get("quilt_loader") or {}).get("depends") or {}):
-                        required.add(str(dep).lower())
-                for meta in ("META-INF/mods.toml", "META-INF/neoforge.mods.toml"):
-                    if meta in names:
-                        text = z.read(meta).decode("utf-8", "replace")
-                        for dep in re.findall(r'modId\s*=\s*"([^"]+)"', text):
+    try:
+        with zipfile.ZipFile(jar) as z:
+            names = z.namelist()
+            if "fabric.mod.json" in names:
+                data = json.loads(z.read("fabric.mod.json").decode("utf-8", "replace"))
+                required.update(str(dep).lower() for dep in (data.get("depends") or {}))
+            if "quilt.mod.json" in names:
+                data = json.loads(z.read("quilt.mod.json").decode("utf-8", "replace"))
+                quilt_depends = (data.get("quilt_loader") or {}).get("depends") or []
+                if isinstance(quilt_depends, dict):
+                    required.update(str(dep).lower() for dep in quilt_depends)
+                else:
+                    for dep in quilt_depends:
+                        if isinstance(dep, str):
                             required.add(dep.lower())
-        except Exception:  # noqa: BLE001
-            pass
+                        elif isinstance(dep, dict) and dep.get("id"):
+                            required.add(str(dep["id"]).lower())
+            for meta in ("META-INF/mods.toml", "META-INF/neoforge.mods.toml"):
+                if meta not in names:
+                    continue
+                data = tomllib.loads(z.read(meta).decode("utf-8", "replace"))
+                for entries in (data.get("dependencies") or {}).values():
+                    if isinstance(entries, dict):
+                        entries = [entries]
+                    for dep in entries or []:
+                        dep_type = str(dep.get("type", "required")).lower()
+                        if dep.get("mandatory", True) is False or dep_type in {
+                            "optional", "incompatible", "discouraged",
+                        }:
+                            continue
+                        if dep.get("modId"):
+                            required.add(str(dep["modId"]).lower())
+    except Exception:  # noqa: BLE001
+        pass
+    return required
+
+
+def required_dep_ids(jars):
+    required = set()
+    for jar in jars:
+        required.update(jar_required_dep_ids(jar))
     return required
 
 
@@ -400,17 +421,29 @@ def remove_client_only_mods():
     if not mods_dir.exists():
         return
     exclusions = fetch_exclusions()
-    required = required_dep_ids(mods_dir)
-    to_remove = []
-    for jar in sorted(mods_dir.glob("*.jar")):
-        if mod_id(jar) in required:
-            log(f"keeping {jar.name}: required dependency")
-            continue
+    jars = sorted(mods_dir.glob("*.jar"))
+    candidates = {}
+    for jar in jars:
         if jar_client_only(jar):
-            to_remove.append((jar, "jar scan"))
+            candidates[jar] = "jar scan"
         elif known_client_only(jar.name, exclusions):
-            to_remove.append((jar, "name list"))
-    for jar, reason in to_remove:
+            candidates[jar] = "name list"
+
+    # Seed the dependency graph only from mods that will actually remain on
+    # the server. A client-only parent must not save its own client-only
+    # dependency (for example Sodium Extra causing Sodium to be retained).
+    required = required_dep_ids(jar for jar in jars if jar not in candidates)
+    changed = True
+    while changed:
+        changed = False
+        for jar in list(candidates):
+            if mod_ids(jar) & required:
+                log(f"keeping {jar.name}: required dependency")
+                required.update(jar_required_dep_ids(jar))
+                del candidates[jar]
+                changed = True
+
+    for jar, reason in candidates.items():
         log(f"removing client-only mod {jar.name} (caught by {reason})")
         jar.unlink(missing_ok=True)
 
@@ -789,6 +822,53 @@ with tempfile.TemporaryDirectory(prefix="content-installer-cf-") as root:
     assert marker["source"] == "curseforge"
     assert marker["modpack"] == "CurseForge fixture"
     assert marker["version"] == "1.20.1"
+
+    shutil.rmtree(WORKSPACE / "mods")
+    (WORKSPACE / "mods").mkdir()
+
+    def fabric_jar(filename, mod_id, environment="*", depends=None):
+        with zipfile.ZipFile(WORKSPACE / "mods" / filename, "w") as archive:
+            archive.writestr(
+                "fabric.mod.json",
+                json.dumps({
+                    "schemaVersion": 1,
+                    "id": mod_id,
+                    "version": "1",
+                    "environment": environment,
+                    "depends": depends or {},
+                }),
+            )
+
+    fabric_jar("server.jar", "server", depends={"required_client_lib": "*"})
+    fabric_jar(
+        "required-client-lib.jar",
+        "required_client_lib",
+        environment="client",
+        depends={"nested_required_lib": "*"},
+    )
+    fabric_jar("nested-required-lib.jar", "nested_required_lib", environment="client")
+    fabric_jar(
+        "sodium-extra.jar",
+        "sodium_extra",
+        environment="client",
+        depends={"sodium": "*"},
+    )
+    fabric_jar("sodium.jar", "sodium", environment="client")
+    with zipfile.ZipFile(WORKSPACE / "mods/forge-server.jar", "w") as archive:
+        archive.writestr(
+            "META-INF/mods.toml",
+            'displayTest="IGNORE_ALL_VERSION"\n[[mods]]\nmodId="forge_server"\nversion="1"\n'
+            '[[dependencies.forge_server]]\nmodId="client_helper"\nmandatory=false\nside="CLIENT"\n',
+        )
+
+    remove_client_only_mods()
+    remaining = {path.name for path in (WORKSPACE / "mods").glob("*.jar")}
+    assert "server.jar" in remaining
+    assert "required-client-lib.jar" in remaining
+    assert "nested-required-lib.jar" in remaining
+    assert "forge-server.jar" in remaining
+    assert "sodium-extra.jar" not in remaining
+    assert "sodium.jar" not in remaining
 "###;
 
         let source = format!("{PYTHON_COMMON}\n{CURSEFORGE_PYTHON}\n{fixture}");
