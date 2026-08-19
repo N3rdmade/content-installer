@@ -14,37 +14,6 @@
   flex-wrap: wrap;
 }
 
-.ci-install-status {
-  margin-top: 16px;
-  border-color: color-mix(in srgb, var(--mantine-color-violet-6) 45%, var(--mantine-color-default-border));
-  background: color-mix(in srgb, var(--mantine-color-violet-9) 7%, var(--mantine-color-body));
-}
-
-.ci-install-status-copy {
-  flex: 1;
-  min-width: 220px;
-}
-
-.ci-install-status-detail {
-  overflow-wrap: anywhere;
-}
-
-.ci-install-status--done {
-  border-color: color-mix(in srgb, var(--mantine-color-green-6) 55%, var(--mantine-color-default-border));
-  background: color-mix(in srgb, var(--mantine-color-green-9) 7%, var(--mantine-color-body));
-}
-
-.ci-install-status--error {
-  border-color: color-mix(in srgb, var(--mantine-color-red-6) 55%, var(--mantine-color-default-border));
-  background: color-mix(in srgb, var(--mantine-color-red-9) 7%, var(--mantine-color-body));
-}
-
-.ci-install-status--cancelled,
-.ci-install-status--cancelling {
-  border-color: var(--mantine-color-default-border);
-  background: var(--mantine-color-default-hover);
-}
-
 .ci-center {
   display: flex;
   flex-direction: column;

@@ -3,6 +3,7 @@ import { faArrowDown, faExclamationTriangle, faExternalLink, faSearch } from '@f
 import { FontAwesomeIcon } from '@fortawesome/react-fontawesome';
 import { Loader } from '@mantine/core';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useNavigate } from 'react-router';
 import Alert from '@/elements/Alert.tsx';
 import Group from '@/elements/Group.tsx';
 import SegmentedControl from '@/elements/SegmentedControl.tsx';
@@ -15,9 +16,10 @@ import Checkbox from '@/elements/input/Checkbox.tsx';
 import { Modal } from '@/elements/modals/Modal.tsx';
 import Select from '@/elements/input/Select.tsx';
 import TextInput from '@/elements/input/TextInput.tsx';
+import { useServerCan } from '@/plugins/usePermissions.ts';
 import { useToast } from '@/providers/ToastProvider.tsx';
 import { useServerStore } from '@/stores/server.ts';
-import { isModpackInstallActive, type ModpackProgress } from './ModpackInstallStatus.tsx';
+import type { ServerDetection } from './detect.ts';
 import { versionLabel } from './versions.ts';
 import {
   CF_CLASS_MODPACKS,
@@ -42,8 +44,7 @@ import {
 } from './modrinth.ts';
 
 interface ModpacksTabProps {
-  progress: ModpackProgress;
-  refreshProgress: () => Promise<ModpackProgress>;
+  detection: ServerDetection;
 }
 
 type Source = 'modrinth' | 'curseforge';
@@ -62,9 +63,11 @@ interface DisplayModpack {
 
 // Content comes from Modrinth/CurseForge project descriptions (trusted API sources)
 
-export default function ModpacksTab({ progress, refreshProgress }: ModpacksTabProps) {
+export default function ModpacksTab({ detection }: ModpacksTabProps) {
   const { addToast } = useToast();
-  const { server, state } = useServerStore();
+  const { server, state, updateServer } = useServerStore();
+  const canReinstall = useServerCan('settings.install');
+  const navigate = useNavigate();
 
   const [source, setSource] = useState<Source>('modrinth');
   const [cfAvailable, setCfAvailable] = useState<boolean | null>(null);
@@ -96,7 +99,6 @@ export default function ModpacksTab({ progress, refreshProgress }: ModpacksTabPr
   const [acceptRisk, setAcceptRisk] = useState(false);
 
   const isRunning = state === 'running' || state === 'starting';
-  const installActive = isModpackInstallActive(progress);
 
   useEffect(() => {
     checkCurseForgeStatus(server.uuid).then(setCfAvailable);
@@ -307,19 +309,30 @@ export default function ModpacksTab({ progress, refreshProgress }: ModpacksTabPr
 
       const res = await fetch(`${endpoint}?${params}`, { method: 'POST' });
       if (!res.ok) throw new Error(await res.text() || `Install failed: ${res.status}`);
-      addToast(`Installing "${selectedModpack.title}" in the background.`, 'success');
+      addToast(`Installing "${selectedModpack.title}". Opening the Console for live logs.`, 'success');
       setSelectedModpack(null);
-      await refreshProgress().catch(() => undefined);
+      navigate(`/server/${server.uuidShort}`);
+      updateServer({ status: 'installing' });
     } catch (err) {
-      addToast(`Could not start modpack install: ${err instanceof Error ? err.message : 'unknown'}`, 'error');
-      await refreshProgress().catch(() => undefined);
+      addToast(`Modpack install failed: ${err instanceof Error ? err.message : 'unknown'}`, 'error');
     } finally {
       setInstalling(false);
     }
-  }, [selectedModpack, selectedModrinthVersion, selectedCfFile, cleanInstall, server.uuid, refreshProgress]);
+  }, [
+    addToast,
+    cleanInstall,
+    navigate,
+    selectedCfFile,
+    selectedModpack,
+    selectedModrinthVersion,
+    server.uuid,
+    server.uuidShort,
+    updateServer,
+  ]);
 
   const selectedFile = selectedModpack?.source === 'modrinth' && selectedModrinthVersion
     ? getPrimaryFile(selectedModrinthVersion) : null;
+
   const sourceOptions = [
     { value: 'modrinth', label: 'Modrinth' },
     ...(cfAvailable ? [{ value: 'curseforge', label: 'CurseForge' }] : []),
@@ -447,7 +460,7 @@ export default function ModpacksTab({ progress, refreshProgress }: ModpacksTabPr
                         leftSection={<FontAwesomeIcon icon={faExternalLink} />}
                         onClick={(e: React.MouseEvent) => {
                           e.stopPropagation();
-                          window.open(`https://modrinth.com/modpack/${selectedModpack.modrinthProject?.slug}`, '_blank', 'noopener');
+                          window.open(`https://modrinth.com/modpack/${selectedModpack.modrinthProject!.slug}`, '_blank', 'noopener');
                         }}>View</Button>
                     )}
                     {selectedModpack.source === 'curseforge' && selectedModpack.curseforgeProject && (
@@ -455,7 +468,7 @@ export default function ModpacksTab({ progress, refreshProgress }: ModpacksTabPr
                         leftSection={<FontAwesomeIcon icon={faExternalLink} />}
                         onClick={(e: React.MouseEvent) => {
                           e.stopPropagation();
-                          window.open(`https://www.curseforge.com/minecraft/modpacks/${selectedModpack.curseforgeProject?.slug}`, '_blank', 'noopener');
+                          window.open(`https://www.curseforge.com/minecraft/modpacks/${selectedModpack.curseforgeProject!.slug}`, '_blank', 'noopener');
                         }}>View</Button>
                     )}
                   </Group>
@@ -513,9 +526,9 @@ export default function ModpacksTab({ progress, refreshProgress }: ModpacksTabPr
               </Alert>
             )}
 
-            {installActive && (
-              <Alert icon={<FontAwesomeIcon icon={faExclamationTriangle} />} color='yellow' variant='light'>
-                Another modpack installation is already active for this server. Its progress is shown above.
+            {!canReinstall && (
+              <Alert color='yellow' variant='light'>
+                You need the server reinstall permission to install modpacks.
               </Alert>
             )}
 
@@ -550,20 +563,20 @@ export default function ModpacksTab({ progress, refreshProgress }: ModpacksTabPr
                   checked={cleanInstall}
                   onChange={(e) => setCleanInstall(e.currentTarget.checked)}
                   color='red'
-                  disabled={installing || installActive || isRunning}
+                  disabled={installing || isRunning}
                 />
                 <Group justify='space-between' align='center' wrap='wrap'>
                   <Checkbox
                     label='I understand this will replace my server files'
                     checked={acceptRisk}
                     onChange={(e) => setAcceptRisk(e.currentTarget.checked)}
-                    disabled={installing || installActive || isRunning}
+                    disabled={installing || isRunning}
                   />
                   <Group gap='sm'>
                     <Button
                       onClick={doInstall}
                       loading={installing}
-                      disabled={installActive || isRunning || !canInstall || !acceptRisk || !hasVersions}
+                      disabled={!canReinstall || isRunning || !canInstall || !acceptRisk || !hasVersions}
                       color='red'
                       leftSection={<FontAwesomeIcon icon={faArrowDown} />}
                     >
@@ -573,7 +586,6 @@ export default function ModpacksTab({ progress, refreshProgress }: ModpacksTabPr
                 </Group>
               </>
             )}
-
           </Stack>
         )}
       </Modal>

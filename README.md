@@ -21,9 +21,7 @@ Powered by [Modrinth](https://modrinth.com) and [CurseForge](https://www.cursefo
 - Full CurseForge modpack install support with `manifest.json` parsing and per-file API resolution
 - Client-only mod filtering via filename patterns, Modrinth metadata lookup, and JAR metadata inspection
 - Clean install option (wipes server files before installing)
-- Refresh-safe background progress tracking with file-by-file status
-- Cancel active installations and dismiss completed, failed, or cancelled jobs
-- Prevents overlapping modpack installs on the same server
+- Modpack installs run through the panel's native Wings install flow: the server locks into an `INSTALLING` state, the browser opens the Console for live file-by-file logs, and progress/cancellation survive refreshes
 
 ### Manage
 - View all installed plugins/mods/datapacks with Modrinth identification via file hashing
@@ -79,8 +77,8 @@ Automatically detects your server type and Minecraft version using a determinist
 │   └── src/
 │       ├── lib.rs             # Route registration, install/remove/modpack handlers
 │       ├── curseforge.rs      # CurseForge API proxy endpoints
+│       ├── install_script.rs  # Wings install scripts (python installers, embedded)
 │       ├── settings.rs        # Extension settings (CurseForge API key)
-│       └── modpack.rs         # Modpack types, progress tracking, client-only detection
 ├── frontend/
 │   └── src/
 │       ├── index.ts           # Extension entry point + route registration
@@ -91,7 +89,6 @@ Automatically detects your server type and Minecraft version using a determinist
 │       ├── ContentInstallerPage.tsx  # Main page with tab routing
 │       ├── BrowseTab.tsx      # Search + install from Modrinth/CurseForge
 │       ├── ModpacksTab.tsx    # Modpack browser + installer
-│       ├── ModpackInstallStatus.tsx # Refresh-safe progress and job controls
 │       ├── ManageTab.tsx      # View + remove + update installed content
 │       └── app.css            # Styling
 ```
@@ -104,9 +101,6 @@ Automatically detects your server type and Minecraft version using a determinist
 - `POST .../remove` - Remove a file
 - `POST .../modpack/install` - Install a Modrinth modpack (.mrpack)
 - `POST .../modpack/cf-install` - Install a CurseForge modpack
-- `GET .../modpack/status` - Check modpack install progress
-- `POST .../modpack/cancel` - Cancel the active modpack install
-- `DELETE .../modpack/status` - Dismiss a terminal install status
 - `GET .../curseforge/search` - Proxy CurseForge search
 - `GET .../curseforge/files` - Proxy CurseForge file listing
 - `GET .../curseforge/description` - Proxy CurseForge mod description
@@ -116,7 +110,7 @@ Automatically detects your server type and Minecraft version using a determinist
 - `GET .../settings` - Get extension settings (masked API key)
 - `PUT .../settings` - Update extension settings
 
-All server routes require `files.create` or `files.delete` permissions. Download URLs are validated against a whitelist of trusted CDN domains (Modrinth CDN, CurseForge CDN).
+Content installation routes require the corresponding `files.create` or `files.delete` permission. Modpack installs additionally require `settings.install`, and cancellation uses Calagopus's native `settings.cancel-install` permission. Download URLs are validated against exact HTTPS CDN hosts (Modrinth CDN, CurseForge CDN).
 
 ## Installation
 
