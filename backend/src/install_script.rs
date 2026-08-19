@@ -563,10 +563,18 @@ CF_ALLOWED_HOSTS = (
     "mediafilez.forgecdn.net",
     "media.forgecdn.net",
 )
+MODRINTH_ALLOWED_HOSTS = (
+    "cdn.modrinth.com",
+    "cdn-raw.modrinth.com",
+)
 
 
 def allowed_cf_url(url):
     return (urlparse(url).hostname or "").lower() in CF_ALLOWED_HOSTS
+
+
+def allowed_modrinth_url(url):
+    return (urlparse(url).hostname or "").lower() in MODRINTH_ALLOWED_HOSTS
 
 
 def post_json(url, body, headers=None):
@@ -594,6 +602,58 @@ def get_cf_files(file_ids):
         )
         for entry in data.get("data", []):
             out[entry.get("id")] = entry
+    return out
+
+
+def curseforge_sha1(hashes):
+    return next(
+        (
+            str(entry.get("value", "")).lower()
+            for entry in hashes or []
+            if entry.get("algo") == 1 and entry.get("value")
+        ),
+        None,
+    )
+
+
+# A project author can disable third-party downloads on CurseForge. When that
+# happens, look up the trusted CurseForge SHA-1 on Modrinth and use the file only
+# if Modrinth independently hosts those exact bytes. This respects CurseForge's
+# restriction and avoids scraping or guessing a forbidden ForgeCDN URL.
+def get_modrinth_fallbacks(files):
+    hashes = sorted(
+        {
+            sha1
+            for file_info in files
+            if not file_info.get("downloadUrl")
+            if (sha1 := curseforge_sha1(file_info.get("hashes")))
+        }
+    )
+    out = {}
+    for i in range(0, len(hashes), 100):
+        chunk = hashes[i:i + 100]
+        try:
+            versions = post_json(
+                "https://api.modrinth.com/v2/version_files",
+                {"hashes": chunk, "algorithm": "sha1"},
+                {
+                    "Accept": "application/json",
+                    "User-Agent": "Regrave/content-installer/2.8.0",
+                },
+            )
+        except Exception as e:  # noqa: BLE001
+            log(f"Modrinth fallback lookup failed ({e}); manual download may be required")
+            continue
+        if not isinstance(versions, dict):
+            continue
+        for sha1 in chunk:
+            version = versions.get(sha1) or versions.get(sha1.upper()) or {}
+            for candidate in version.get("files") or []:
+                candidate_hash = str((candidate.get("hashes") or {}).get("sha1", "")).lower()
+                url = candidate.get("url")
+                if candidate_hash == sha1 and url and allowed_modrinth_url(url):
+                    out[sha1] = url
+                    break
     return out
 
 
@@ -632,21 +692,45 @@ def main():
     downloaded = 0
     skipped = 0
     files_by_id = get_cf_files([cf_file.get("fileID") for cf_file in required])
+    modrinth_fallbacks = get_modrinth_fallbacks(files_by_id.values())
     for cf_file in required:
         fid = cf_file.get("fileID")
         file_info = files_by_id.get(fid) or {}
         if not file_info:
             raise RuntimeError(f"failed to resolve required CurseForge file {fid}")
         filename = safe_filename(str(file_info.get("fileName") or "unknown.jar"))
+        hashes = file_info.get("hashes")
+        destination = WORKSPACE / "mods" / filename
+
+        # Keep valid files from an interrupted install, and make the documented
+        # manual-upload recovery usable when clean install is disabled.
+        if destination.is_file() and any(
+            entry.get("algo") in (1, 2) and entry.get("value") for entry in hashes or []
+        ):
+            try:
+                verify_curseforge_hash(destination, hashes)
+                log(f"using existing verified file ({downloaded + 1}/{total}): {filename}")
+                downloaded += 1
+                continue
+            except RuntimeError:
+                log(f"existing file failed verification; downloading again: {filename}")
+
         url = file_info.get("downloadUrl")
         if not url:
-            raise RuntimeError(f"required file {filename} does not allow third-party downloads")
-        if not allowed_cf_url(url):
+            sha1 = curseforge_sha1(hashes)
+            url = modrinth_fallbacks.get(sha1)
+            if not url:
+                raise RuntimeError(
+                    f"required file {filename} blocks third-party downloads on CurseForge and "
+                    "no identical Modrinth file was found. Download it manually from "
+                    f"CurseForge, upload it to mods/{filename}, then retry with Clean install off"
+                )
+            log(f"using identical Modrinth copy for restricted CurseForge file: {filename}")
+        elif not allowed_cf_url(url):
             raise RuntimeError(f"required file {filename} returned an untrusted download host")
         log(f"downloading ({downloaded + 1}/{total}): {filename}")
-        destination = WORKSPACE / "mods" / filename
         download(url, destination)
-        verify_curseforge_hash(destination, file_info.get("hashes"))
+        verify_curseforge_hash(destination, hashes)
         downloaded += 1
 
     mc = str(manifest.get("minecraft", {}).get("version", "1.21.1"))
@@ -761,23 +845,53 @@ mod tests {
 import tempfile
 
 calls = []
+modrinth_calls = []
+downloaded_urls = []
 
 
 def post_json(url, body, headers=None):
-    assert url == "https://api.curseforge.com/v1/mods/files"
-    assert headers == {"x-api-key": "test-key", "Accept": "application/json"}
-    file_ids = body["fileIds"]
-    calls.append(list(file_ids))
+    if url == "https://api.curseforge.com/v1/mods/files":
+        assert headers == {"x-api-key": "test-key", "Accept": "application/json"}
+        file_ids = body["fileIds"]
+        calls.append(list(file_ids))
+        return {
+            "data": [
+                {
+                    "id": file_id,
+                    "fileName": f"fixture-{file_id}.jar",
+                    "downloadUrl": (
+                        None
+                        if file_id == 51
+                        else f"https://edge.forgecdn.net/files/test/{file_id}.jar"
+                    ),
+                    "hashes": (
+                        [{
+                            "algo": 1,
+                            "value": hashlib.sha1(f"fixture-{file_id}".encode()).hexdigest(),
+                        }]
+                        if file_id in (51, 52)
+                        else []
+                    ),
+                }
+                for file_id in file_ids
+            ]
+        }
+
+    assert url == "https://api.modrinth.com/v2/version_files"
+    assert headers == {
+        "Accept": "application/json",
+        "User-Agent": "Regrave/content-installer/2.8.0",
+    }
+    assert body["algorithm"] == "sha1"
+    modrinth_calls.append(list(body["hashes"]))
     return {
-        "data": [
-            {
-                "id": file_id,
-                "fileName": f"fixture-{file_id}.jar",
-                "downloadUrl": f"https://edge.forgecdn.net/files/test/{file_id}.jar",
-                "hashes": [],
-            }
-            for file_id in file_ids
-        ]
+        sha1: {
+            "files": [{
+                "url": f"https://cdn.modrinth.com/data/fixture/{sha1}/fixture-51.jar",
+                "hashes": {"sha1": sha1},
+            }]
+        }
+        for sha1 in body["hashes"]
     }
 
 
@@ -798,6 +912,11 @@ def download(url, destination, headers=None):
             archive.writestr("overrides/server.properties", "must not replace")
         return
 
+    downloaded_urls.append(url)
+    if url.startswith("https://cdn.modrinth.com/"):
+        destination.write_bytes(b"fixture-51")
+        return
+
     assert url.startswith("https://edge.forgecdn.net/files/test/")
     with zipfile.ZipFile(destination, "w") as archive:
         file_id = destination.stem.removeprefix("fixture-")
@@ -812,9 +931,14 @@ fetch_exclusions = lambda: []
 with tempfile.TemporaryDirectory(prefix="content-installer-cf-") as root:
     WORKSPACE = Path(root)
     (WORKSPACE / "server.properties").write_text("existing=true\n", encoding="utf-8")
+    (WORKSPACE / "mods").mkdir()
+    (WORKSPACE / "mods/fixture-52.jar").write_bytes(b"fixture-52")
     main()
 
     assert [len(call) for call in calls] == [50, 50, 21]
+    assert len(modrinth_calls) == 1 and len(modrinth_calls[0]) == 1
+    assert any(url.startswith("https://cdn.modrinth.com/") for url in downloaded_urls)
+    assert not any(url.endswith("/52.jar") for url in downloaded_urls)
     assert len(list((WORKSPACE / "mods").glob("fixture-*.jar"))) == 121
     assert (WORKSPACE / "config/fixture.txt").read_text() == "fixture config"
     assert (WORKSPACE / "server.properties").read_text() == "existing=true\n"
