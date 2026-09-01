@@ -95,7 +95,8 @@ export default function ModpacksTab({ detection }: ModpacksTabProps) {
 
   const [versionsLoading, setVersionsLoading] = useState(false);
   const [installing, setInstalling] = useState(false);
-  const [cleanInstall, setCleanInstall] = useState(true);
+  const [wipeFiles, setWipeFiles] = useState(true);
+  const [deleteWorld, setDeleteWorld] = useState(false);
   const [acceptRisk, setAcceptRisk] = useState(false);
 
   const isRunning = state === 'running' || state === 'starting';
@@ -191,7 +192,8 @@ export default function ModpacksTab({ detection }: ModpacksTabProps) {
     setVersionsLoading(true);
     setDetailLoading(true);
     setDetailBody('');
-    setCleanInstall(true);
+    setWipeFiles(true);
+    setDeleteWorld(false);
     setAcceptRisk(false);
     setModrinthVersions([]);
     setSelectedModrinthVersion(null);
@@ -288,7 +290,8 @@ export default function ModpacksTab({ detection }: ModpacksTabProps) {
         endpoint = `/api/client/servers/${server.uuid}/content-installer/modpack/install`;
         params = new URLSearchParams({
           mrpack_url: file.url,
-          clean_install: String(cleanInstall),
+          wipe_files: String(wipeFiles),
+          delete_world: String(deleteWorld),
           modpack_name: selectedModpack.title,
           version_name: selectedModrinthVersion.version_number,
         });
@@ -301,7 +304,8 @@ export default function ModpacksTab({ detection }: ModpacksTabProps) {
         endpoint = `/api/client/servers/${server.uuid}/content-installer/modpack/cf-install`;
         params = new URLSearchParams({
           zip_url: selectedCfFile.downloadUrl,
-          clean_install: String(cleanInstall),
+          wipe_files: String(wipeFiles),
+          delete_world: String(deleteWorld),
           modpack_name: selectedModpack.title,
           version_name: selectedCfFile.displayName,
         });
@@ -320,7 +324,7 @@ export default function ModpacksTab({ detection }: ModpacksTabProps) {
     }
   }, [
     addToast,
-    cleanInstall,
+    deleteWorld,
     navigate,
     selectedCfFile,
     selectedModpack,
@@ -328,6 +332,7 @@ export default function ModpacksTab({ detection }: ModpacksTabProps) {
     server.uuid,
     server.uuidShort,
     updateServer,
+    wipeFiles,
   ]);
 
   const selectedFile = selectedModpack?.source === 'modrinth' && selectedModrinthVersion
@@ -341,6 +346,10 @@ export default function ModpacksTab({ detection }: ModpacksTabProps) {
   const canInstall = selectedModpack?.source === 'modrinth'
     ? !!selectedModrinthVersion && !!selectedFile
     : !!selectedCfFile && !!selectedCfFile?.downloadUrl;
+
+  const worldDescription = detection.worldDirs.length > 0
+    ? `Detected: ${detection.worldDirs.join(', ')}`
+    : 'No existing Minecraft world was detected.';
 
   return (
     <div className='ci-browse'>
@@ -554,20 +563,35 @@ export default function ModpacksTab({ detection }: ModpacksTabProps) {
               <Text size='sm' c='dimmed'>{selectedModpack.description}</Text>
             )}
 
-            {/* Bottom bar: checkboxes + install */}
+            {/* Safer install options carried over from our Pelican manager. */}
             {hasVersions && !versionsLoading && (
               <>
                 <Checkbox
-                  label='Clean install (recommended)'
-                  description='Wipes all existing server files before installing.'
-                  checked={cleanInstall}
-                  onChange={(e) => setCleanInstall(e.currentTarget.checked)}
+                  label='Wipe old server / modpack files'
+                  description='Recommended when switching packs. Keeps detected Minecraft worlds and operator files such as server.properties, whitelist, bans and ops.'
+                  checked={wipeFiles}
+                  onChange={(e) => setWipeFiles(e.currentTarget.checked)}
                   color='red'
                   disabled={installing || isRunning}
                 />
+                <Checkbox
+                  label='Delete existing world'
+                  description={worldDescription}
+                  checked={deleteWorld}
+                  onChange={(e) => setDeleteWorld(e.currentTarget.checked)}
+                  color='red'
+                  disabled={installing || isRunning || detection.worldDirs.length === 0}
+                />
+                {deleteWorld && (
+                  <Alert icon={<FontAwesomeIcon icon={faExclamationTriangle} />} color='red' variant='light'>
+                    World deletion is permanent unless you have a backup. Only directories containing level.dat are targeted.
+                  </Alert>
+                )}
                 <Group justify='space-between' align='center' wrap='wrap'>
                   <Checkbox
-                    label='I understand this will replace my server files'
+                    label={deleteWorld
+                      ? 'I understand this will replace server files and delete the detected world'
+                      : 'I understand this will replace my server files'}
                     checked={acceptRisk}
                     onChange={(e) => setAcceptRisk(e.currentTarget.checked)}
                     disabled={installing || isRunning}
