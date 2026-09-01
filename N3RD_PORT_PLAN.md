@@ -2,6 +2,25 @@
 
 This branch keeps Calagopus-native Content Installer as the technical base and ports the strongest UX and install-safety features from N3rdmade/pelican-modpackmanager.
 
+## Current implementation status
+
+- [x] Separate wipe-files and delete-world controls.
+- [x] level.dat based world discovery and conservative preservation.
+- [x] Calagopus-native runtime planner for egg/startup/image selection.
+- [x] Minecraft-to-Java fallback selection (8/17/21) with provider override.
+- [x] FTB/modpacks.ch browse, versions and install-manifest backend.
+- [x] ATLauncher browse, versions and Configs.json install-manifest backend.
+- [x] FTB + ATLauncher native Wings installation scripts.
+- [x] All Sources browser with partial-provider failure handling.
+- [x] Rich provider cards, install plan and FTB artwork gallery strip.
+- [x] Native runtime preparation endpoint shared by providers.
+- [ ] Wire runtime preparation into the Modrinth/CurseForge frontend install path.
+- [ ] Backup-before-install UI and completion wait.
+- [ ] Selective server.properties preservation instead of preserving the whole file.
+- [ ] Full old multi-loader/game-version/category filter parity.
+- [ ] Compile/test on Calagopus Heavy and repair API/version differences.
+- [ ] Live non-destructive modpack test before merging.
+
 ## Architectural rule
 
 - Keep Calagopus-native Rust backend, React frontend, Wings install flow, permissions, activity logging, Modrinth/CurseForge proxying, hashing/update management, and server detection where it is stronger.
