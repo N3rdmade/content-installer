@@ -54,8 +54,6 @@ fn version_parts(mc: &str) -> (u32, u32, u32) {
     )
 }
 
-/// Java policy mirrors the practical Minecraft cutovers used by modern packs.
-/// A provider-supplied Java major always wins over this fallback.
 pub fn recommended_java(mc: Option<&str>, explicit: Option<u8>) -> u8 {
     if let Some(explicit) = explicit.filter(|value| *value >= 8) {
         return explicit;
@@ -140,10 +138,6 @@ fn concrete_startup(loader: &str, mc: Option<&str>) -> String {
     }
 }
 
-/// Switch the Calagopus server to the best matching installed egg, runtime image,
-/// and a concrete startup command. Missing loader eggs are not fatal: the custom
-/// installer still lays down the correct loader and we keep the current egg while
-/// updating startup/image only when safe.
 pub async fn apply(
     state: &State,
     server: &mut Server,
@@ -161,8 +155,6 @@ pub async fn apply(
         let image = select_image(&egg, java);
         (Some(egg.name.to_string()), Some(egg.uuid), image)
     } else {
-        // If no matching egg is installed, retain the current image rather than
-        // inventing a registry URL that may not exist on this panel.
         (None, None, Some(server.image.to_string()))
     };
 
@@ -174,7 +166,9 @@ pub async fn apply(
     };
 
     server.update(state, options).await?;
-    server.sync(&state.database).await?;
+    // Server::sync consumes self, so sync a clone while keeping the caller's
+    // in-memory server available for the following native install call.
+    server.clone().sync(&state.database).await?;
 
     Ok(AppliedRuntime {
         loader: loader.to_string(),
