@@ -13,10 +13,23 @@ use shared::{
     },
     State,
 };
-use std::sync::Arc;
+use std::{collections::HashSet, sync::Arc};
 
 /// CurseForge API keys are bcrypt hashes and always this long.
 const CF_API_KEY_LEN: usize = 60;
+
+/// Files that belong to the server/operator rather than a specific modpack.
+/// These survive a normal "wipe old server files" operation. Worlds are
+/// detected separately by looking for level.dat instead of assuming their names.
+const PRESERVED_SERVER_FILES: &[&str] = &[
+    "server.properties",
+    "eula.txt",
+    "ops.json",
+    "whitelist.json",
+    "banned-ips.json",
+    "banned-players.json",
+    "usercache.json",
+];
 
 #[derive(Default)]
 pub struct ExtensionStruct;
@@ -198,6 +211,117 @@ fn is_https_url_from(value: &str, allowed_hosts: &[&str]) -> bool {
 
 fn err(status: StatusCode, msg: impl Into<String>) -> (StatusCode, String) {
     (status, msg.into())
+}
+
+async fn list_server_directory(
+    wings: &wings_api::client::WingsClient,
+    server_uuid: uuid::Uuid,
+    directory: &str,
+) -> Result<Vec<wings_api::DirectoryEntry>, (StatusCode, String)> {
+    let result = wings
+        .get_servers_server_files_list(
+            server_uuid,
+            &wings_api::servers_server_files_list::get::Query {
+                directory: Some(directory.into()),
+                per_page: Some(1000),
+                page: Some(1),
+                ..Default::default()
+            },
+        )
+        .await
+        .map_err(|e| err(StatusCode::BAD_GATEWAY, format!("Wings file listing failed: {e:?}")))?;
+
+    Ok(result.entries)
+}
+
+/// Detect Minecraft worlds by the presence of level.dat. If a directory cannot
+/// be inspected we conservatively preserve it during a wipe rather than risking
+/// removal of unknown user data.
+async fn detect_worlds_and_uncertain_dirs(
+    wings: &wings_api::client::WingsClient,
+    server_uuid: uuid::Uuid,
+    root_entries: &[wings_api::DirectoryEntry],
+) -> (HashSet<String>, HashSet<String>) {
+    let mut worlds = HashSet::new();
+    let mut uncertain = HashSet::new();
+
+    for entry in root_entries.iter().filter(|entry| entry.directory) {
+        let name = entry.name.to_string();
+        let path = format!("/{name}");
+        match list_server_directory(wings, server_uuid, &path).await {
+            Ok(entries) => {
+                if entries.iter().any(|child| child.file && child.name.as_str() == "level.dat") {
+                    worlds.insert(name);
+                }
+            }
+            Err(_) => {
+                uncertain.insert(name);
+            }
+        }
+    }
+
+    (worlds, uncertain)
+}
+
+/// Recreates the safe cleanup behavior from N3rdmade's Pelican Modpack Manager:
+/// a normal wipe removes the old pack/runtime while preserving operator files
+/// and every detected world. World deletion is an independent explicit option.
+async fn prepare_server_for_modpack(
+    wings: &wings_api::client::WingsClient,
+    server_uuid: uuid::Uuid,
+    wipe_files: bool,
+    delete_world: bool,
+) -> Result<Vec<String>, (StatusCode, String)> {
+    if !wipe_files && !delete_world {
+        return Ok(Vec::new());
+    }
+
+    let root_entries = list_server_directory(wings, server_uuid, "/").await?;
+    let (worlds, uncertain_dirs) =
+        detect_worlds_and_uncertain_dirs(wings, server_uuid, &root_entries).await;
+
+    let mut delete_names: Vec<compact_str::CompactString> = Vec::new();
+
+    for entry in &root_entries {
+        let name = entry.name.as_str();
+        let is_world = worlds.contains(name);
+
+        if is_world {
+            if delete_world {
+                delete_names.push(entry.name.clone());
+            }
+            continue;
+        }
+
+        if wipe_files {
+            if PRESERVED_SERVER_FILES.contains(&name) {
+                continue;
+            }
+            if entry.directory && uncertain_dirs.contains(name) {
+                // Fail safe: an unreadable directory may contain a world or other
+                // irreplaceable user data. Leave it alone instead of guessing.
+                continue;
+            }
+            delete_names.push(entry.name.clone());
+        }
+    }
+
+    if !delete_names.is_empty() {
+        wings
+            .post_servers_server_files_delete(
+                server_uuid,
+                &wings_api::servers_server_files_delete::post::RequestBody {
+                    root: "/".into(),
+                    files: delete_names,
+                },
+            )
+            .await
+            .map_err(|e| err(StatusCode::BAD_GATEWAY, format!("Wings cleanup failed: {e:?}")))?;
+    }
+
+    let mut detected_worlds: Vec<String> = worlds.into_iter().collect();
+    detected_worlds.sort();
+    Ok(detected_worlds)
 }
 
 #[derive(Deserialize)]
@@ -391,9 +515,13 @@ async fn remove_content(
 struct ModpackInstallParams {
     /// URL to the .mrpack file on cdn.modrinth.com
     mrpack_url: String,
-    /// Whether to wipe the server first
+    /// Remove the previous pack/runtime while preserving detected worlds and operator files.
+    /// `clean_install` is accepted as a backwards-compatible alias for older clients.
+    #[serde(default, alias = "clean_install")]
+    wipe_files: bool,
+    /// Delete detected Minecraft world directories. Independent from wipe_files.
     #[serde(default)]
-    clean_install: bool,
+    delete_world: bool,
     #[serde(default)]
     modpack_name: Option<String>,
     #[serde(default)]
@@ -427,6 +555,11 @@ async fn modpack_install(
     permissions
         .has_server_permission("settings.install")
         .map_err(|_| err(StatusCode::FORBIDDEN, "Missing settings.install permission"))?;
+    if params.wipe_files || params.delete_world {
+        permissions
+            .has_server_permission("files.delete")
+            .map_err(|_| err(StatusCode::FORBIDDEN, "Missing files.delete permission"))?;
+    }
 
     // Validate mrpack URL is from Modrinth CDN
     if !is_https_url_from(&params.mrpack_url, MODRINTH_PACK_HOSTS) {
@@ -442,13 +575,32 @@ async fn modpack_install(
         ));
     }
 
+    let node = server
+        .node
+        .fetch_cached(&state.database)
+        .await
+        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")))?;
+    let wings = node
+        .api_client(&state.database)
+        .await
+        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")))?;
+    let detected_worlds = prepare_server_for_modpack(
+        &wings,
+        server.uuid,
+        params.wipe_files,
+        params.delete_world,
+    )
+    .await?;
+
     let modpack_name = install_label(params.modpack_name.as_deref(), "Modrinth modpack");
     let version_name = install_label(params.version_name.as_deref(), "Selected version");
 
+    // Never use Calagopus's blanket clean-install wipe here. We perform the
+    // world-aware cleanup above so the user's world is only removed explicitly.
     server
         .install(
             &state,
-            params.clean_install,
+            false,
             Some(install_script::modrinth_script(
                 &params.mrpack_url,
                 &modpack_name,
@@ -470,7 +622,9 @@ async fn modpack_install(
                 "source": "modrinth",
                 "modpack": modpack_name,
                 "version": version_name,
-                "clean_install": params.clean_install,
+                "wipe_files": params.wipe_files,
+                "delete_world": params.delete_world,
+                "detected_worlds": detected_worlds,
             }),
         )
         .await;
@@ -482,8 +636,10 @@ async fn modpack_install(
 struct CfModpackInstallParams {
     /// CurseForge CDN URL to the modpack zip
     zip_url: String,
+    #[serde(default, alias = "clean_install")]
+    wipe_files: bool,
     #[serde(default)]
-    clean_install: bool,
+    delete_world: bool,
     #[serde(default)]
     modpack_name: Option<String>,
     #[serde(default)]
@@ -506,6 +662,11 @@ async fn cf_modpack_install(
     permissions
         .has_server_permission("settings.install")
         .map_err(|_| err(StatusCode::FORBIDDEN, "Missing settings.install permission"))?;
+    if params.wipe_files || params.delete_world {
+        permissions
+            .has_server_permission("files.delete")
+            .map_err(|_| err(StatusCode::FORBIDDEN, "Missing files.delete permission"))?;
+    }
 
     if !is_https_url_from(&params.zip_url, CURSEFORGE_PACK_HOSTS) {
         return Err(err(StatusCode::BAD_REQUEST, "URL must be from CurseForge CDN"));
@@ -534,13 +695,30 @@ async fn cf_modpack_install(
         ext.curseforge_api_key.to_string()
     };
 
+    let node = server
+        .node
+        .fetch_cached(&state.database)
+        .await
+        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")))?;
+    let wings = node
+        .api_client(&state.database)
+        .await
+        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")))?;
+    let detected_worlds = prepare_server_for_modpack(
+        &wings,
+        server.uuid,
+        params.wipe_files,
+        params.delete_world,
+    )
+    .await?;
+
     let modpack_name = install_label(params.modpack_name.as_deref(), "CurseForge modpack");
     let version_name = install_label(params.version_name.as_deref(), "Selected version");
 
     server
         .install(
             &state,
-            params.clean_install,
+            false,
             Some(install_script::curseforge_script(
                 &params.zip_url,
                 &cf_api_key,
@@ -563,7 +741,9 @@ async fn cf_modpack_install(
                 "source": "curseforge",
                 "modpack": modpack_name,
                 "version": version_name,
-                "clean_install": params.clean_install,
+                "wipe_files": params.wipe_files,
+                "delete_world": params.delete_world,
+                "detected_worlds": detected_worlds,
             }),
         )
         .await;
