@@ -12,7 +12,7 @@ import ServerContentContainer from '@/elements/containers/ServerContentContainer
 import { useServerStore } from '@/stores/server.ts';
 import BrowseTab from './BrowseTab.tsx';
 import ManageTab from './ManageTab.tsx';
-import ModpacksTab from './ModpacksTab.tsx';
+import HybridModpacksTab from './HybridModpacksTab.tsx';
 import { detectServer, getAvailableTabs, type ServerDetection } from './detect.ts';
 
 type MainTab = 'browse' | 'manage' | 'modpacks';
@@ -35,7 +35,6 @@ export default function ContentInstallerPage() {
   const [availableTabs, setAvailableTabs] = useState<ContentTab[]>(['plugins', 'mods', 'datapacks']);
   const [selectedWorld, setSelectedWorld] = useState<string>('world');
 
-  // Detect server type on mount
   useEffect(() => {
     setDetecting(true);
     detectServer(
@@ -57,15 +56,11 @@ export default function ContentInstallerPage() {
 
   const onInstalled = () => setManageRefreshKey((k) => k + 1);
 
-  /** Get the install directory for the current content type */
   const getInstallDir = (): string => {
-    if (contentTab === 'datapacks') {
-      return `${selectedWorld}/datapacks`;
-    }
+    if (contentTab === 'datapacks') return `${selectedWorld}/datapacks`;
     return contentTab;
   };
 
-  // Show modpacks tab for mod-capable servers or unknown
   const showModpacks = detection
     ? detection.platform === 'mods' || detection.platform === 'both' || detection.platform === 'unknown' || detection.platform === 'vanilla'
     : true;
@@ -74,9 +69,7 @@ export default function ContentInstallerPage() {
     <ServerContentContainer title='Content Installer'>
       <div className='ci-page'>
         <div className='ci-page-header'>
-          <Title order={3}>
-            {mainTab === 'modpacks' ? 'Modpacks' : TAB_LABELS[contentTab]}
-          </Title>
+          <Title order={3}>{mainTab === 'modpacks' ? 'Modpacks' : TAB_LABELS[contentTab]}</Title>
         </div>
 
         {detecting ? (
@@ -86,9 +79,7 @@ export default function ContentInstallerPage() {
           </div>
         ) : (
           <>
-            {/* Tab selectors */}
             <div className='ci-tab-bar'>
-              {/* Content type selector */}
               {availableTabs.length > 1 && mainTab !== 'modpacks' && (
                 <SegmentedControl
                   value={contentTab}
@@ -98,7 +89,6 @@ export default function ContentInstallerPage() {
                 />
               )}
 
-              {/* Main tab selector */}
               <SegmentedControl
                 value={mainTab}
                 onChange={(v) => setMainTab(v as MainTab)}
@@ -111,7 +101,6 @@ export default function ContentInstallerPage() {
               />
             </div>
 
-            {/* World selector for datapacks */}
             {contentTab === 'datapacks' && mainTab !== 'modpacks' && detection && detection.worldDirs.length > 1 && (
               <Group gap='sm' mb='sm'>
                 <Text size='sm' fw={500}>World:</Text>
@@ -125,7 +114,6 @@ export default function ContentInstallerPage() {
               </Group>
             )}
 
-            {/* No detection warning */}
             {detection?.platform === 'unknown' && (
               <Alert
                 icon={<FontAwesomeIcon icon={faExclamationTriangle} />}
@@ -139,7 +127,6 @@ export default function ContentInstallerPage() {
               </Alert>
             )}
 
-            {/* Tab content */}
             {detection && mainTab === 'browse' && (
               <BrowseTab
                 detection={detection}
@@ -156,9 +143,7 @@ export default function ContentInstallerPage() {
                 refreshKey={manageRefreshKey}
               />
             )}
-            {detection && mainTab === 'modpacks' && (
-              <ModpacksTab detection={detection} />
-            )}
+            {detection && mainTab === 'modpacks' && <HybridModpacksTab detection={detection} />}
           </>
         )}
       </div>
