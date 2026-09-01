@@ -1,5 +1,4 @@
 import { useEffect } from 'react';
-import { uploadFiles } from '@/lib/files/uploadManager.ts';
 
 const ARTWORK_ATTR = 'data-n3rdmade-server-artwork';
 const PENDING_ARTWORK_PREFIX = 'n3rdmade:server-artwork:';
@@ -33,7 +32,6 @@ function getPendingArtwork(routeId: string): PendingArtwork | null {
     const raw = localStorage.getItem(pendingKey(routeId));
     if (!raw) return null;
 
-    // Backward compatibility with the first beta, which stored only the URL.
     if (/^https?:\/\//i.test(raw)) {
       return { url: raw, serverUuid: routeId, routeId, serverName: 'Server' };
     }
@@ -136,19 +134,36 @@ async function makeMinecraftIcon(url: string): Promise<File> {
   }
 }
 
+async function uploadServerIcon(serverUuid: string, file: File): Promise<void> {
+  const ticketResponse = await fetch(`/api/client/servers/${serverUuid}/files/upload`);
+  if (!ticketResponse.ok) {
+    throw new Error(`Could not create upload ticket (${ticketResponse.status})`);
+  }
+
+  const ticket = await ticketResponse.json() as { url?: string };
+  if (!ticket.url) throw new Error('Upload ticket did not include a URL');
+
+  const separator = ticket.url.includes('?') ? '&' : '?';
+  const uploadUrl = `${ticket.url}${separator}directory=${encodeURIComponent('/')}`;
+  const form = new FormData();
+  form.append('files', file, 'server-icon.png');
+
+  const uploadResponse = await fetch(uploadUrl, {
+    method: 'POST',
+    body: form,
+  });
+  if (!uploadResponse.ok) {
+    throw new Error(`server-icon.png upload failed (${uploadResponse.status})`);
+  }
+}
+
 async function syncPendingArtwork(rawPending: PendingArtwork) {
   if (syncing.has(rawPending.routeId)) return;
   syncing.add(rawPending.routeId);
   try {
     const pending = await resolveServerIdentity(rawPending);
     const file = await makeMinecraftIcon(pending.url);
-    await uploadFiles({
-      type: 'server',
-      serverUuid: pending.serverUuid,
-      serverName: pending.serverName,
-      routeId: pending.routeId,
-      directory: '/',
-    }, [file]);
+    await uploadServerIcon(pending.serverUuid, file);
 
     const old = objectUrls.get(pending.routeId);
     if (old) URL.revokeObjectURL(old);
@@ -220,8 +235,6 @@ function captureSelectedModpackArtwork(event: MouseEvent) {
   const src = icon?.currentSrc || icon?.src;
   if (!src || !/^https?:\/\//i.test(src)) return;
 
-  // Capture before the installer can wipe the root directory. On the next dashboard
-  // visit we resolve the short route id to the full server UUID and upload server-icon.png.
   queueServerArtwork(routeId, routeId, 'Server', src);
 }
 
