@@ -3,18 +3,18 @@ import { Extension, ExtensionContext } from 'shared';
 import AdminConfigPage from './AdminConfigPage.tsx';
 import ContentInstallerPage from './ContentInstallerPage.tsx';
 
-class ContentInstaller extends Extension {
+class N3rdmadeContentManager extends Extension {
   public cardConfigurationPage = AdminConfigPage;
 
   public initialize(ctx: ExtensionContext): void {
     ctx.extensionRegistry.routes.addServerRoute({
-      name: 'Content',
+      name: 'Content Manager',
       icon: faPuzzlePiece,
-      path: '/content',
+      path: '/content-manager',
       element: ContentInstallerPage,
       permission: 'files.create',
     });
   }
 }
 
-export default new ContentInstaller();
+export default new N3rdmadeContentManager();
