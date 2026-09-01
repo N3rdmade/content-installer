@@ -29,17 +29,17 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: 1.97.0
+          toolchain: 1.98.0
 
       - name: Mount extension in Calagopus workspace
         run: |
-          rm -rf panel/backend-extensions/gg_ir77_contentinstaller
-          mkdir -p panel/backend-extensions/gg_ir77_contentinstaller
-          cp -a extension/backend/. panel/backend-extensions/gg_ir77_contentinstaller/
+          rm -rf panel/backend-extensions/gg_n3rdmade_contentmanager
+          mkdir -p panel/backend-extensions/gg_n3rdmade_contentmanager
+          cp -a extension/backend/. panel/backend-extensions/gg_n3rdmade_contentmanager/
 
       - name: Cargo check extension
         working-directory: panel
-        run: cargo check -p gg_ir77_contentinstaller
+        run: cargo check -p gg_n3rdmade_contentmanager
 
   package:
     runs-on: ubuntu-latest
@@ -52,8 +52,8 @@ jobs:
           test -f frontend/package.json
           test -f frontend/src/index.ts
       - name: Build test package
-        run: zip -qr gg_ir77_contentinstaller-hybrid.c7s.zip Metadata.toml frontend backend
+        run: zip -qr n3rdmade-content-manager-hybrid.c7s.zip Metadata.toml frontend backend
       - uses: actions/upload-artifact@v4
         with:
-          name: gg_ir77_contentinstaller-hybrid
-          path: gg_ir77_contentinstaller-hybrid.c7s.zip
+          name: n3rdmade-content-manager-hybrid
+          path: n3rdmade-content-manager-hybrid.c7s.zip
