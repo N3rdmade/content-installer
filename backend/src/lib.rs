@@ -1,5 +1,10 @@
+mod atlauncher;
 mod curseforge;
+mod ftb;
 mod install_script;
+mod provider_install;
+mod provider_routes;
+mod runtime;
 mod settings;
 
 use axum::{extract::Query, http::StatusCode, response::IntoResponse};
@@ -86,12 +91,36 @@ impl Extension for ExtensionStruct {
                         axum::routing::get(curseforge::description),
                     )
                     .route(
+                        "/content-installer/ftb/search",
+                        axum::routing::get(ftb::search),
+                    )
+                    .route(
+                        "/content-installer/ftb/versions",
+                        axum::routing::get(ftb::versions),
+                    )
+                    .route(
+                        "/content-installer/atlauncher/search",
+                        axum::routing::get(atlauncher::search),
+                    )
+                    .route(
+                        "/content-installer/atlauncher/versions",
+                        axum::routing::get(atlauncher::versions),
+                    )
+                    .route(
                         "/content-installer/modpack/install",
                         axum::routing::post(modpack_install),
                     )
                     .route(
                         "/content-installer/modpack/cf-install",
                         axum::routing::post(cf_modpack_install),
+                    )
+                    .route(
+                        "/content-installer/modpack/ftb-install",
+                        axum::routing::post(provider_routes::ftb_install),
+                    )
+                    .route(
+                        "/content-installer/modpack/atlauncher-install",
+                        axum::routing::post(provider_routes::atlauncher_install),
                     )
             })
             .add_admin_api_router(|router| {
@@ -121,7 +150,6 @@ async fn admin_get_settings(
     let ext = settings
         .find_extension_settings::<settings::ContentInstallerSettings>()
         .map_err(|_| err(StatusCode::INTERNAL_SERVER_ERROR, "Settings not found"))?;
-    // Mask the API key for display
     let masked = if ext.curseforge_api_key.is_empty() {
         String::new()
     } else {
@@ -132,11 +160,6 @@ async fn admin_get_settings(
             "*".repeat(key.len())
         }
     };
-    // CurseForge keys are bcrypt strings: exactly 60 chars, `$2a$10$...`, no whitespace.
-    // The mask above only shows first-4 and last-4, so a key that lost or gained characters
-    // in the middle looks identical to a good one — which is the failure mode in #22, where
-    // re-pasting from the same bad source reproduced it every time. Length is the signal the
-    // mask cannot carry, so report it and let the admin UI compare against 60.
     let key_len = ext.curseforge_api_key.chars().count();
     let malformed = !ext.curseforge_api_key.is_empty()
         && (!ext.curseforge_api_key.starts_with("$2a$")
@@ -170,10 +193,6 @@ async fn admin_put_settings(
         .map_err(|_| err(StatusCode::INTERNAL_SERVER_ERROR, "Settings not found"))?;
 
     if let Some(key) = body.curseforge_api_key {
-        // Trim before storing. A key pasted with a trailing newline is not a legal header
-        // value, so reqwest fails at build time and the user gets "CurseForge request
-        // failed: builder error" — which says nothing about the real problem (#22).
-        // Surrounding spaces are harmless (headers strip OWS) but there is no reason to keep them.
         ext.curseforge_api_key = key.trim().into();
     }
 
@@ -234,9 +253,6 @@ async fn list_server_directory(
     Ok(result.entries)
 }
 
-/// Detect Minecraft worlds by the presence of level.dat. If a directory cannot
-/// be inspected we conservatively preserve it during a wipe rather than risking
-/// removal of unknown user data.
 async fn detect_worlds_and_uncertain_dirs(
     wings: &wings_api::client::WingsClient,
     server_uuid: uuid::Uuid,
@@ -263,9 +279,6 @@ async fn detect_worlds_and_uncertain_dirs(
     (worlds, uncertain)
 }
 
-/// Recreates the safe cleanup behavior from N3rdmade's Pelican Modpack Manager:
-/// a normal wipe removes the old pack/runtime while preserving operator files
-/// and every detected world. World deletion is an independent explicit option.
 async fn prepare_server_for_modpack(
     wings: &wings_api::client::WingsClient,
     server_uuid: uuid::Uuid,
@@ -298,8 +311,6 @@ async fn prepare_server_for_modpack(
                 continue;
             }
             if entry.directory && uncertain_dirs.contains(name) {
-                // Fail safe: an unreadable directory may contain a world or other
-                // irreplaceable user data. Leave it alone instead of guessing.
                 continue;
             }
             delete_names.push(entry.name.clone());
@@ -331,7 +342,6 @@ struct InstallParams {
     directory: String,
 }
 
-/// POST: Download a plugin/mod file to the server
 async fn install_content(
     state: GetState,
     permissions: GetPermissionManager,
@@ -418,7 +428,6 @@ async fn install_content(
     })))
 }
 
-/// GET: Check download progress
 async fn install_status(
     state: GetState,
     _permissions: GetPermissionManager,
@@ -457,7 +466,6 @@ struct RemoveParams {
     directory: String,
 }
 
-/// POST: Remove a plugin/mod file
 async fn remove_content(
     state: GetState,
     permissions: GetPermissionManager,
@@ -513,13 +521,9 @@ async fn remove_content(
 
 #[derive(Deserialize)]
 struct ModpackInstallParams {
-    /// URL to the .mrpack file on cdn.modrinth.com
     mrpack_url: String,
-    /// Remove the previous pack/runtime while preserving detected worlds and operator files.
-    /// `clean_install` is accepted as a backwards-compatible alias for older clients.
     #[serde(default, alias = "clean_install")]
     wipe_files: bool,
-    /// Delete detected Minecraft world directories. Independent from wipe_files.
     #[serde(default)]
     delete_world: bool,
     #[serde(default)]
@@ -541,7 +545,6 @@ fn install_label(value: Option<&str>, fallback: &str) -> String {
         .collect()
 }
 
-/// POST: Install a Modrinth modpack (.mrpack).
 async fn modpack_install(
     state: GetState,
     permissions: GetPermissionManager,
@@ -561,13 +564,10 @@ async fn modpack_install(
             .map_err(|_| err(StatusCode::FORBIDDEN, "Missing files.delete permission"))?;
     }
 
-    // Validate mrpack URL is from Modrinth CDN
     if !is_https_url_from(&params.mrpack_url, MODRINTH_PACK_HOSTS) {
         return Err(err(StatusCode::BAD_REQUEST, "mrpack URL must be from cdn.modrinth.com"));
     }
 
-    // Refuse while the server itself is installing/restoring: the panel owns
-    // that flag and `Server::install` re-checks it transactionally.
     if server.status.is_some() {
         return Err(err(
             StatusCode::CONFLICT,
@@ -595,8 +595,6 @@ async fn modpack_install(
     let modpack_name = install_label(params.modpack_name.as_deref(), "Modrinth modpack");
     let version_name = install_label(params.version_name.as_deref(), "Selected version");
 
-    // Never use Calagopus's blanket clean-install wipe here. We perform the
-    // world-aware cleanup above so the user's world is only removed explicitly.
     server
         .install(
             &state,
@@ -634,7 +632,6 @@ async fn modpack_install(
 
 #[derive(Deserialize)]
 struct CfModpackInstallParams {
-    /// CurseForge CDN URL to the modpack zip
     zip_url: String,
     #[serde(default, alias = "clean_install")]
     wipe_files: bool,
@@ -646,9 +643,6 @@ struct CfModpackInstallParams {
     version_name: Option<String>,
 }
 
-/// POST: Install a CurseForge modpack. Same native Wings install flow; the
-/// script receives the CurseForge API key through its environment to resolve
-/// file download URLs.
 async fn cf_modpack_install(
     state: GetState,
     permissions: GetPermissionManager,
@@ -679,7 +673,6 @@ async fn cf_modpack_install(
         ));
     }
 
-    // The install script needs the CurseForge API key to resolve downloads.
     let cf_api_key = {
         let settings_guard = state
             .settings
