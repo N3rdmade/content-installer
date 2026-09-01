@@ -1,8 +1,8 @@
 [package]
 name = "gg_ir77_contentinstaller"
 description = "Minecraft Plugin & Mod Installer Extension"
-authors = ["Regrave"]
-version = "2.8.0"
+authors = ["Regrave", "N3rdmade"]
+version = "2.9.0-beta.1"
 edition = { workspace = true }
 
 [dependencies]
