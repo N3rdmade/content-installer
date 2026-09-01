@@ -1,0 +1,49 @@
+name: Hybrid Extension Check
+
+on:
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  backend:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout extension PR
+        uses: actions/checkout@v4
+
+      - name: Checkout Calagopus
+        uses: actions/checkout@v4
+        with:
+          repository: calagopus/panel
+          path: panel
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.97.0
+
+      - name: Mount extension in Calagopus workspace
+        run: |
+          rm -rf panel/backend-extensions/gg_ir77_contentinstaller
+          mkdir -p panel/backend-extensions/gg_ir77_contentinstaller
+          cp -a backend/. panel/backend-extensions/gg_ir77_contentinstaller/
+
+      - name: Cargo check extension
+        working-directory: panel
+        run: cargo check -p gg_ir77_contentinstaller
+
+  package:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build test package
+        run: zip -qr gg_ir77_contentinstaller-hybrid.c7s.zip Metadata.toml frontend backend
+      - uses: actions/upload-artifact@v4
+        with:
+          name: gg_ir77_contentinstaller-hybrid
+          path: gg_ir77_contentinstaller-hybrid.c7s.zip
