@@ -19,6 +19,11 @@ function serverIdFromLink(link: HTMLAnchorElement): string | null {
   return match?.[1] ?? null;
 }
 
+function currentServerId(): string | null {
+  const match = window.location.pathname.match(/^\/server\/([^/?#]+)/);
+  return match?.[1] ?? null;
+}
+
 function pendingKey(routeId: string): string {
   return `${PENDING_ARTWORK_PREFIX}${routeId}`;
 }
@@ -34,10 +39,10 @@ function getPendingArtwork(routeId: string): PendingArtwork | null {
     }
 
     const value = JSON.parse(raw) as Partial<PendingArtwork>;
-    if (!value.url || !value.serverUuid) return null;
+    if (!value.url) return null;
     return {
       url: value.url,
-      serverUuid: value.serverUuid,
+      serverUuid: value.serverUuid || routeId,
       routeId: value.routeId || routeId,
       serverName: value.serverName || 'Server',
     };
@@ -68,6 +73,21 @@ function clearPendingArtwork(routeId: string) {
     localStorage.removeItem(pendingKey(routeId));
   } catch {
     // Ignore storage failures.
+  }
+}
+
+async function resolveServerIdentity(pending: PendingArtwork): Promise<PendingArtwork> {
+  try {
+    const response = await fetch(`/api/client/servers/${pending.routeId}`);
+    if (!response.ok) return pending;
+    const data = await response.json() as Record<string, unknown>;
+    return {
+      ...pending,
+      serverUuid: typeof data.uuid === 'string' ? data.uuid : pending.serverUuid,
+      serverName: typeof data.name === 'string' ? data.name : pending.serverName,
+    };
+  } catch {
+    return pending;
   }
 }
 
@@ -116,10 +136,11 @@ async function makeMinecraftIcon(url: string): Promise<File> {
   }
 }
 
-async function syncPendingArtwork(pending: PendingArtwork) {
-  if (syncing.has(pending.routeId)) return;
-  syncing.add(pending.routeId);
+async function syncPendingArtwork(rawPending: PendingArtwork) {
+  if (syncing.has(rawPending.routeId)) return;
+  syncing.add(rawPending.routeId);
   try {
+    const pending = await resolveServerIdentity(rawPending);
     const file = await makeMinecraftIcon(pending.url);
     await uploadFiles({
       type: 'server',
@@ -137,7 +158,7 @@ async function syncPendingArtwork(pending: PendingArtwork) {
     // Keep the pending data so a later dashboard visit can retry automatically.
     console.warn('[N3rdmade Content Manager] Could not sync server artwork:', error);
   } finally {
-    syncing.delete(pending.routeId);
+    syncing.delete(rawPending.routeId);
   }
 }
 
@@ -185,6 +206,25 @@ async function enhanceLink(link: HTMLAnchorElement) {
   }
 }
 
+function captureSelectedModpackArtwork(event: MouseEvent) {
+  const target = event.target;
+  if (!(target instanceof Element)) return;
+  const button = target.closest('button');
+  if (!button || button.disabled || !button.textContent?.includes('Install Modpack')) return;
+
+  const routeId = currentServerId();
+  if (!routeId) return;
+
+  const modal = button.closest('[role="dialog"]') ?? document;
+  const icon = modal.querySelector<HTMLImageElement>('img.ci-detail-icon');
+  const src = icon?.currentSrc || icon?.src;
+  if (!src || !/^https?:\/\//i.test(src)) return;
+
+  // Capture before the installer can wipe the root directory. On the next dashboard
+  // visit we resolve the short route id to the full server UUID and upload server-icon.png.
+  queueServerArtwork(routeId, routeId, 'Server', src);
+}
+
 function scan() {
   document
     .querySelectorAll<HTMLAnchorElement>('a.block.min-w-0[href^="/server/"]')
@@ -197,8 +237,12 @@ export default function ServerArtworkEnhancer() {
 
     const observer = new MutationObserver(() => scan());
     observer.observe(document.body, { childList: true, subtree: true });
+    document.addEventListener('click', captureSelectedModpackArtwork, true);
 
-    return () => observer.disconnect();
+    return () => {
+      observer.disconnect();
+      document.removeEventListener('click', captureSelectedModpackArtwork, true);
+    };
   }, []);
 
   return null;
