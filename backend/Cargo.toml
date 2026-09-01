@@ -1,5 +1,5 @@
 [package]
-name = "gg_ir77_contentinstaller"
+name = "gg_n3rdmade_contentmanager"
 description = "Minecraft Plugin & Mod Installer Extension"
 authors = ["Regrave", "N3rdmade"]
 version = "2.9.0-beta.1"
