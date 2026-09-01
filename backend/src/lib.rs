@@ -20,12 +20,8 @@ use shared::{
 };
 use std::{collections::HashSet, sync::Arc};
 
-/// CurseForge API keys are bcrypt hashes and always this long.
 const CF_API_KEY_LEN: usize = 60;
 
-/// Files that belong to the server/operator rather than a specific modpack.
-/// These survive a normal "wipe old server files" operation. Worlds are
-/// detected separately by looking for level.dat instead of assuming their names.
 const PRESERVED_SERVER_FILES: &[&str] = &[
     "server.properties",
     "eula.txt",
@@ -107,6 +103,10 @@ impl Extension for ExtensionStruct {
                         axum::routing::get(atlauncher::versions),
                     )
                     .route(
+                        "/content-installer/runtime/prepare",
+                        axum::routing::post(provider_routes::prepare_runtime),
+                    )
+                    .route(
                         "/content-installer/modpack/install",
                         axum::routing::post(modpack_install),
                     )
@@ -136,8 +136,6 @@ impl Extension for ExtensionStruct {
             })
     }
 }
-
-// ---- Admin settings endpoints ----
 
 async fn admin_get_settings(
     state: GetState,
@@ -517,6 +515,45 @@ async fn remove_content(
     Ok(axum::Json(serde_json::json!({ "success": true })))
 }
 
+#[derive(Deserialize)]
+struct RuntimeHints {
+    #[serde(default)]
+    loader: Option<String>,
+    #[serde(default)]
+    minecraft: Option<String>,
+    #[serde(default)]
+    loader_version: Option<String>,
+    #[serde(default)]
+    java: Option<u8>,
+}
+
+async fn apply_runtime_hints(
+    state: &GetState,
+    permissions: &GetPermissionManager,
+    server: &mut GetServer,
+    hints: &RuntimeHints,
+) -> Result<Option<runtime::AppliedRuntime>, (StatusCode, String)> {
+    let Some(loader) = hints.loader.as_deref().filter(|value| !value.trim().is_empty()) else {
+        return Ok(None);
+    };
+
+    permissions
+        .has_server_permission("startup.command")
+        .map_err(|_| err(StatusCode::FORBIDDEN, "Missing startup.command permission for runtime switch"))?;
+
+    runtime::apply(
+        state,
+        &mut server.0,
+        loader,
+        hints.minecraft.as_deref(),
+        hints.loader_version.as_deref(),
+        hints.java,
+    )
+    .await
+    .map(Some)
+    .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("Runtime switch failed: {e}")))
+}
+
 // ─── Modpack Installation ────────────────────────────────────
 
 #[derive(Deserialize)]
@@ -530,6 +567,8 @@ struct ModpackInstallParams {
     modpack_name: Option<String>,
     #[serde(default)]
     version_name: Option<String>,
+    #[serde(flatten)]
+    runtime: RuntimeHints,
 }
 
 fn install_label(value: Option<&str>, fallback: &str) -> String {
@@ -548,7 +587,7 @@ fn install_label(value: Option<&str>, fallback: &str) -> String {
 async fn modpack_install(
     state: GetState,
     permissions: GetPermissionManager,
-    server: GetServer,
+    mut server: GetServer,
     activity_logger: GetServerActivityLogger,
     Query(params): Query<ModpackInstallParams>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
@@ -592,6 +631,8 @@ async fn modpack_install(
     )
     .await?;
 
+    let applied_runtime = apply_runtime_hints(&state, &permissions, &mut server, &params.runtime).await?;
+
     let modpack_name = install_label(params.modpack_name.as_deref(), "Modrinth modpack");
     let version_name = install_label(params.version_name.as_deref(), "Selected version");
 
@@ -620,6 +661,7 @@ async fn modpack_install(
                 "source": "modrinth",
                 "modpack": modpack_name,
                 "version": version_name,
+                "runtime": applied_runtime,
                 "wipe_files": params.wipe_files,
                 "delete_world": params.delete_world,
                 "detected_worlds": detected_worlds,
@@ -641,12 +683,14 @@ struct CfModpackInstallParams {
     modpack_name: Option<String>,
     #[serde(default)]
     version_name: Option<String>,
+    #[serde(flatten)]
+    runtime: RuntimeHints,
 }
 
 async fn cf_modpack_install(
     state: GetState,
     permissions: GetPermissionManager,
-    server: GetServer,
+    mut server: GetServer,
     activity_logger: GetServerActivityLogger,
     Query(params): Query<CfModpackInstallParams>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
@@ -705,6 +749,8 @@ async fn cf_modpack_install(
     )
     .await?;
 
+    let applied_runtime = apply_runtime_hints(&state, &permissions, &mut server, &params.runtime).await?;
+
     let modpack_name = install_label(params.modpack_name.as_deref(), "CurseForge modpack");
     let version_name = install_label(params.version_name.as_deref(), "Selected version");
 
@@ -734,6 +780,7 @@ async fn cf_modpack_install(
                 "source": "curseforge",
                 "modpack": modpack_name,
                 "version": version_name,
+                "runtime": applied_runtime,
                 "wipe_files": params.wipe_files,
                 "delete_world": params.delete_world,
                 "detected_worlds": detected_worlds,
