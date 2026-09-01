@@ -6,40 +6,66 @@ const PENDING_ARTWORK_PREFIX = 'n3rdmade:server-artwork:';
 const objectUrls = new Map<string, string>();
 const syncing = new Set<string>();
 
+interface PendingArtwork {
+  url: string;
+  serverUuid: string;
+  routeId: string;
+  serverName: string;
+}
+
 function serverIdFromLink(link: HTMLAnchorElement): string | null {
   const href = link.getAttribute('href') ?? '';
   const match = href.match(/^\/server\/([^/?#]+)/);
   return match?.[1] ?? null;
 }
 
-function currentServerId(): string | null {
-  const match = window.location.pathname.match(/^\/server\/([^/?#]+)/);
-  return match?.[1] ?? null;
+function pendingKey(routeId: string): string {
+  return `${PENDING_ARTWORK_PREFIX}${routeId}`;
 }
 
-function pendingKey(serverId: string): string {
-  return `${PENDING_ARTWORK_PREFIX}${serverId}`;
-}
-
-function getPendingArtwork(serverId: string): string | null {
+function getPendingArtwork(routeId: string): PendingArtwork | null {
   try {
-    return localStorage.getItem(pendingKey(serverId));
+    const raw = localStorage.getItem(pendingKey(routeId));
+    if (!raw) return null;
+
+    // Backward compatibility with the first beta, which stored only the URL.
+    if (/^https?:\/\//i.test(raw)) {
+      return { url: raw, serverUuid: routeId, routeId, serverName: 'Server' };
+    }
+
+    const value = JSON.parse(raw) as Partial<PendingArtwork>;
+    if (!value.url || !value.serverUuid) return null;
+    return {
+      url: value.url,
+      serverUuid: value.serverUuid,
+      routeId: value.routeId || routeId,
+      serverName: value.serverName || 'Server',
+    };
   } catch {
     return null;
   }
 }
 
-function setPendingArtwork(serverId: string, url: string) {
+export function queueServerArtwork(
+  serverUuid: string,
+  routeId: string,
+  serverName: string,
+  url: string,
+) {
+  if (!/^https?:\/\//i.test(url)) return;
   try {
-    localStorage.setItem(pendingKey(serverId), url);
+    localStorage.setItem(
+      pendingKey(routeId),
+      JSON.stringify({ url, serverUuid, routeId, serverName } satisfies PendingArtwork),
+    );
   } catch {
     // Browser storage is best-effort; the install should never fail because of artwork.
   }
 }
 
-function clearPendingArtwork(serverId: string) {
+function clearPendingArtwork(routeId: string) {
   try {
-    localStorage.removeItem(pendingKey(serverId));
+    localStorage.removeItem(pendingKey(routeId));
   } catch {
     // Ignore storage failures.
   }
@@ -90,28 +116,28 @@ async function makeMinecraftIcon(url: string): Promise<File> {
   }
 }
 
-async function syncPendingArtwork(serverId: string, serverName: string, url: string) {
-  if (syncing.has(serverId)) return;
-  syncing.add(serverId);
+async function syncPendingArtwork(pending: PendingArtwork) {
+  if (syncing.has(pending.routeId)) return;
+  syncing.add(pending.routeId);
   try {
-    const file = await makeMinecraftIcon(url);
+    const file = await makeMinecraftIcon(pending.url);
     await uploadFiles({
       type: 'server',
-      serverUuid: serverId,
-      serverName,
-      routeId: serverId,
+      serverUuid: pending.serverUuid,
+      serverName: pending.serverName,
+      routeId: pending.routeId,
       directory: '/',
     }, [file]);
 
-    const old = objectUrls.get(serverId);
+    const old = objectUrls.get(pending.routeId);
     if (old) URL.revokeObjectURL(old);
-    objectUrls.delete(serverId);
-    clearPendingArtwork(serverId);
+    objectUrls.delete(pending.routeId);
+    clearPendingArtwork(pending.routeId);
   } catch (error) {
-    // Keep the pending URL so a later dashboard visit can retry automatically.
+    // Keep the pending data so a later dashboard visit can retry automatically.
     console.warn('[N3rdmade Content Manager] Could not sync server artwork:', error);
   } finally {
-    syncing.delete(serverId);
+    syncing.delete(pending.routeId);
   }
 }
 
@@ -138,44 +164,25 @@ async function enhanceLink(link: HTMLAnchorElement) {
   if (link.dataset.n3rdmadeArtworkChecked === 'true') return;
   link.dataset.n3rdmadeArtworkChecked = 'true';
 
-  const serverId = serverIdFromLink(link);
-  if (!serverId) return;
+  const routeId = serverIdFromLink(link);
+  if (!routeId) return;
 
   const title = link.querySelector('span.text-xl');
   if (!(title instanceof HTMLElement)) return;
 
-  const pending = getPendingArtwork(serverId);
+  const pending = getPendingArtwork(routeId);
   if (pending) {
-    insertArtwork(title, pending);
-    void syncPendingArtwork(serverId, title.textContent?.trim() || 'Server', pending);
+    insertArtwork(title, pending.url);
+    void syncPendingArtwork(pending);
     return;
   }
 
   try {
-    const src = await loadServerIcon(serverId);
+    const src = await loadServerIcon(routeId);
     if (src) insertArtwork(title, src);
   } catch {
     // Missing or unreadable server-icon.png should simply keep the stock card.
   }
-}
-
-function captureSelectedModpackArtwork(event: MouseEvent) {
-  const target = event.target;
-  if (!(target instanceof Element)) return;
-  const button = target.closest('button');
-  if (!button || button.disabled || !button.textContent?.includes('Install Modpack')) return;
-
-  const serverId = currentServerId();
-  if (!serverId) return;
-
-  const modal = button.closest('[role="dialog"]') ?? document;
-  const icon = modal.querySelector<HTMLImageElement>('img.ci-detail-icon');
-  const src = icon?.currentSrc || icon?.src;
-  if (!src || !/^https?:\/\//i.test(src)) return;
-
-  // The install may wipe the current root files. Remember the chosen pack art now;
-  // the dashboard writes a fresh Minecraft-compatible server-icon.png afterward.
-  setPendingArtwork(serverId, src);
 }
 
 function scan() {
@@ -190,12 +197,8 @@ export default function ServerArtworkEnhancer() {
 
     const observer = new MutationObserver(() => scan());
     observer.observe(document.body, { childList: true, subtree: true });
-    document.addEventListener('click', captureSelectedModpackArtwork, true);
 
-    return () => {
-      observer.disconnect();
-      document.removeEventListener('click', captureSelectedModpackArtwork, true);
-    };
+    return () => observer.disconnect();
   }, []);
 
   return null;
