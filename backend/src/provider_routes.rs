@@ -86,6 +86,49 @@ async fn cf_key(state: &GetState) -> Option<String> {
     (!settings.curseforge_api_key.is_empty()).then(|| settings.curseforge_api_key.to_string())
 }
 
+/// Shared runtime switch used by Modrinth and CurseForge before their existing
+/// native install flow. FTB/ATLauncher call the same runtime module internally.
+#[derive(Deserialize)]
+pub struct RuntimePrepareParams {
+    loader: String,
+    minecraft: Option<String>,
+    loader_version: Option<String>,
+    java: Option<u8>,
+}
+
+pub async fn prepare_runtime(
+    state: GetState,
+    permissions: GetPermissionManager,
+    mut server: GetServer,
+    activity: GetServerActivityLogger,
+    Query(params): Query<RuntimePrepareParams>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    permissions
+        .has_server_permission("startup.command")
+        .map_err(|_| err(StatusCode::FORBIDDEN, "Missing startup.command permission"))?;
+    if server.status.is_some() {
+        return Err(err(StatusCode::CONFLICT, "Server is already installing or restoring"));
+    }
+
+    let applied = runtime::apply(
+        &state,
+        &mut server.0,
+        &params.loader,
+        params.minecraft.as_deref(),
+        params.loader_version.as_deref(),
+        params.java,
+    )
+    .await
+    .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("Runtime switch failed: {e}")))?;
+
+    activity.log(
+        "server:content-installer.runtime.prepare",
+        serde_json::json!({ "runtime": applied }),
+    ).await;
+
+    Ok(axum::Json(serde_json::json!({ "success": true, "runtime": applied })))
+}
+
 #[derive(Deserialize)]
 pub struct FtbInstallParams {
     pack_id: u64,
