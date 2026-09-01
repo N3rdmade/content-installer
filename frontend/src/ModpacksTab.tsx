@@ -24,7 +24,6 @@ import { versionLabel } from './versions.ts';
 import {
   CF_CLASS_MODPACKS,
   checkCurseForgeStatus,
-  formatDownloads as cfFormatDownloads,
   getCurseForgeDescription,
   getCurseForgeFiles,
   searchCurseForge,
@@ -47,7 +46,17 @@ interface ModpacksTabProps {
   detection: ServerDetection;
 }
 
-type Source = 'modrinth' | 'curseforge';
+type ProviderSource = 'modrinth' | 'curseforge' | 'ftb' | 'atlauncher';
+type Source = 'all' | ProviderSource;
+
+interface ProviderVersion {
+  id: string;
+  label: string;
+  gameVersion?: string | null;
+  loader?: string | null;
+  loaderVersion?: string | null;
+  java?: number | null;
+}
 
 interface DisplayModpack {
   id: string;
@@ -56,12 +65,70 @@ interface DisplayModpack {
   downloads: number;
   author: string;
   iconUrl: string | null;
-  source: Source;
+  source: ProviderSource;
+  websiteUrl?: string | null;
+  loaders?: string[];
+  gameVersion?: string | null;
+  gallery?: Array<{ url: string; thumbnailUrl?: string }>;
+  availableVersions?: ProviderVersion[];
   modrinthProject?: ModrinthProject;
   curseforgeProject?: CurseForgeProject;
 }
 
-// Content comes from Modrinth/CurseForge project descriptions (trusted API sources)
+const providerLabel: Record<ProviderSource, string> = {
+  modrinth: 'Modrinth',
+  curseforge: 'CurseForge',
+  ftb: 'FTB',
+  atlauncher: 'ATLauncher',
+};
+
+const providerColor: Record<ProviderSource, string> = {
+  modrinth: 'green',
+  curseforge: 'orange',
+  ftb: 'blue',
+  atlauncher: 'violet',
+};
+
+function asProviderVersions(data: unknown): ProviderVersion[] {
+  if (!Array.isArray(data)) return [];
+  return data.map((item) => {
+    const row = item as Record<string, unknown>;
+    const id = String(row.id ?? row.versionNumber ?? '');
+    const gameVersion = typeof row.gameVersion === 'string'
+      ? row.gameVersion
+      : Array.isArray(row.gameVersions) ? String(row.gameVersions[0] ?? '') : null;
+    const loader = typeof row.loader === 'string'
+      ? row.loader
+      : Array.isArray(row.loaders) ? String(row.loaders[0] ?? '') : null;
+    return {
+      id,
+      label: String(row.displayName ?? row.name ?? row.versionNumber ?? id),
+      gameVersion,
+      loader,
+      loaderVersion: typeof row.loaderVersion === 'string' ? row.loaderVersion : null,
+      java: typeof row.java === 'number' ? row.java : null,
+    };
+  }).filter((version) => version.id !== '');
+}
+
+function mapExternalPack(raw: Record<string, unknown>, source: 'ftb' | 'atlauncher'): DisplayModpack {
+  return {
+    id: String(raw.id ?? raw.slug ?? ''),
+    title: String(raw.name ?? 'Unknown'),
+    description: String(raw.summary ?? raw.description ?? ''),
+    downloads: Number(raw.downloadCount ?? 0),
+    author: String(raw.author ?? providerLabel[source]),
+    iconUrl: typeof raw.iconUrl === 'string' ? raw.iconUrl : null,
+    source,
+    websiteUrl: typeof raw.websiteUrl === 'string' ? raw.websiteUrl : null,
+    loaders: Array.isArray(raw.loaders) ? raw.loaders.map(String) : [],
+    gameVersion: typeof raw.gameVersions === 'string' ? raw.gameVersions : null,
+    gallery: Array.isArray(raw.gallery)
+      ? raw.gallery.map((item) => item as { url: string; thumbnailUrl?: string }).filter((item) => !!item.url)
+      : [],
+    availableVersions: asProviderVersions(raw.availableVersions),
+  };
+}
 
 export default function ModpacksTab({ detection }: ModpacksTabProps) {
   const { addToast } = useToast();
@@ -69,33 +136,29 @@ export default function ModpacksTab({ detection }: ModpacksTabProps) {
   const canReinstall = useServerCan('settings.install');
   const navigate = useNavigate();
 
-  const [source, setSource] = useState<Source>('modrinth');
+  const [source, setSource] = useState<Source>('all');
   const [cfAvailable, setCfAvailable] = useState<boolean | null>(null);
-
-  // Search state
   const [query, setQuery] = useState('');
   const [sortBy, setSortBy] = useState<string>('downloads');
   const [results, setResults] = useState<DisplayModpack[]>([]);
-  const [totalHits, setTotalHits] = useState(0);
+  const [hasMore, setHasMore] = useState(false);
   const [loading, setLoading] = useState(false);
+  const [providerWarning, setProviderWarning] = useState<string | null>(null);
   const searchTimer = useRef<ReturnType<typeof setTimeout>>(null);
 
-  // Install modal
   const [selectedModpack, setSelectedModpack] = useState<DisplayModpack | null>(null);
-  // Modrinth versions
   const [modrinthVersions, setModrinthVersions] = useState<ModrinthVersion[]>([]);
   const [selectedModrinthVersion, setSelectedModrinthVersion] = useState<ModrinthVersion | null>(null);
-  // CurseForge files
   const [cfFiles, setCfFiles] = useState<CurseForgeFile[]>([]);
   const [selectedCfFile, setSelectedCfFile] = useState<CurseForgeFile | null>(null);
-
-  // Detail
-  const [detailBody, setDetailBody] = useState<string>('');
+  const [providerVersions, setProviderVersions] = useState<ProviderVersion[]>([]);
+  const [selectedProviderVersion, setSelectedProviderVersion] = useState<ProviderVersion | null>(null);
+  const [detailBody, setDetailBody] = useState('');
   const [detailLoading, setDetailLoading] = useState(false);
-
   const [versionsLoading, setVersionsLoading] = useState(false);
   const [installing, setInstalling] = useState(false);
-  const [cleanInstall, setCleanInstall] = useState(true);
+  const [wipeFiles, setWipeFiles] = useState(true);
+  const [deleteWorld, setDeleteWorld] = useState(false);
   const [acceptRisk, setAcceptRisk] = useState(false);
 
   const isRunning = state === 'running' || state === 'starting';
@@ -104,13 +167,12 @@ export default function ModpacksTab({ detection }: ModpacksTabProps) {
     checkCurseForgeStatus(server.uuid).then(setCfAvailable);
   }, [server.uuid]);
 
-  // Modrinth search
-  const doModrinthSearch = useCallback(async (q: string, sort: string, offset: number) => {
+  const doModrinthSearch = useCallback(async (q: string, sort: string, page: number) => {
     const res = await searchProjects({
       query: q || undefined,
       projectType: 'modpack',
       index: sort as SearchIndex,
-      offset,
+      offset: page * 20,
       limit: 20,
     });
     return {
@@ -124,12 +186,12 @@ export default function ModpacksTab({ detection }: ModpacksTabProps) {
         source: 'modrinth',
         modrinthProject: p,
       })),
-      total: res.total_hits,
+      hasMore: (page + 1) * 20 < res.total_hits,
     };
   }, []);
 
-  // CurseForge search
-  const doCurseForgeSearch = useCallback(async (q: string, sort: string, offset: number) => {
+  const doCurseForgeSearch = useCallback(async (q: string, sort: string, page: number) => {
+    if (!cfAvailable) return { items: [] as DisplayModpack[], hasMore: false };
     const sortMap: Record<string, number> = {
       relevance: 1, downloads: 6, follows: 2, newest: 11, updated: 3,
     };
@@ -138,7 +200,7 @@ export default function ModpacksTab({ detection }: ModpacksTabProps) {
       classId: CF_CLASS_MODPACKS,
       sortField: sortMap[sort] ?? 6,
       sortOrder: 'desc',
-      index: offset,
+      index: page * 20,
       pageSize: 20,
     });
     return {
@@ -152,283 +214,299 @@ export default function ModpacksTab({ detection }: ModpacksTabProps) {
         source: 'curseforge',
         curseforgeProject: p,
       })),
-      total: res.pagination.totalCount,
+      hasMore: (page + 1) * 20 < res.pagination.totalCount,
+    };
+  }, [cfAvailable, server.uuid]);
+
+  const doExternalSearch = useCallback(async (provider: 'ftb' | 'atlauncher', q: string, page: number) => {
+    const params = new URLSearchParams({ query: q, page: String(page), page_size: '20' });
+    const endpoint = `/api/client/servers/${server.uuid}/content-installer/${provider}/search?${params}`;
+    const response = await fetch(endpoint);
+    if (!response.ok) throw new Error(await response.text() || `${providerLabel[provider]} search failed`);
+    const body = await response.json() as { data?: Record<string, unknown>[]; hasMore?: boolean };
+    return {
+      items: (body.data ?? []).map((item) => mapExternalPack(item, provider)),
+      hasMore: !!body.hasMore,
     };
   }, [server.uuid]);
 
-  const doSearch = useCallback(async (q: string, sort: string, offset: number) => {
+  const searchOne = useCallback(async (provider: ProviderSource, q: string, sort: string, page: number) => {
+    if (provider === 'modrinth') return doModrinthSearch(q, sort, page);
+    if (provider === 'curseforge') return doCurseForgeSearch(q, sort, page);
+    return doExternalSearch(provider, q, page);
+  }, [doCurseForgeSearch, doExternalSearch, doModrinthSearch]);
+
+  const doSearch = useCallback(async (q: string, sort: string, page: number) => {
     setLoading(true);
+    setProviderWarning(null);
     try {
-      const result = source === 'curseforge'
-        ? await doCurseForgeSearch(q, sort, offset)
-        : await doModrinthSearch(q, sort, offset);
-      if (offset === 0) {
-        setResults(result.items);
-      } else {
-        setResults((prev) => [...prev, ...result.items]);
+      if (source !== 'all') {
+        const result = await searchOne(source, q, sort, page);
+        setResults((previous) => page === 0 ? result.items : [...previous, ...result.items]);
+        setHasMore(result.hasMore);
+        return;
       }
-      setTotalHits(result.total);
-    } catch (err) {
-      addToast(`Search failed: ${err instanceof Error ? err.message : 'unknown'}`, 'error');
+
+      const providers: ProviderSource[] = ['modrinth', ...(cfAvailable ? ['curseforge' as const] : []), 'ftb', 'atlauncher'];
+      const settled = await Promise.allSettled(providers.map((provider) => searchOne(provider, q, sort, page)));
+      const good = settled.flatMap((result) => result.status === 'fulfilled' ? result.value.items : []);
+      const failed = settled.filter((result) => result.status === 'rejected').length;
+      const sorted = [...good].sort((a, b) => sort === 'newest' ? 0 : b.downloads - a.downloads);
+      setResults((previous) => page === 0 ? sorted : [...previous, ...sorted]);
+      setHasMore(settled.some((result) => result.status === 'fulfilled' && result.value.hasMore));
+      if (failed > 0) setProviderWarning(`${failed} provider${failed === 1 ? '' : 's'} could not be reached. Results from the others are still shown.`);
+    } catch (error) {
+      addToast(`Search failed: ${error instanceof Error ? error.message : 'unknown'}`, 'error');
     } finally {
       setLoading(false);
     }
-  }, [source, doModrinthSearch, doCurseForgeSearch]);
+  }, [addToast, cfAvailable, searchOne, source]);
 
   useEffect(() => {
     setResults([]);
-    setTotalHits(0);
+    setHasMore(false);
     if (searchTimer.current) clearTimeout(searchTimer.current);
     searchTimer.current = setTimeout(() => doSearch(query, sortBy, 0), 300);
     return () => { if (searchTimer.current) clearTimeout(searchTimer.current); };
-  }, [query, sortBy, doSearch, source]);
+  }, [query, sortBy, source, doSearch]);
 
-  const loadMore = () => doSearch(query, sortBy, results.length);
+  const loadMore = () => {
+    const page = source === 'all'
+      ? Math.max(1, Math.ceil(results.length / Math.max(20, cfAvailable ? 80 : 60)))
+      : Math.floor(results.length / 20);
+    doSearch(query, sortBy, page);
+  };
 
-  // Open install modal
   const openInstall = useCallback(async (modpack: DisplayModpack) => {
     setSelectedModpack(modpack);
     setVersionsLoading(true);
     setDetailLoading(true);
-    setDetailBody('');
-    setCleanInstall(true);
+    setDetailBody(modpack.description);
+    setWipeFiles(true);
+    setDeleteWorld(false);
     setAcceptRisk(false);
     setModrinthVersions([]);
     setSelectedModrinthVersion(null);
     setCfFiles([]);
     setSelectedCfFile(null);
+    setProviderVersions([]);
+    setSelectedProviderVersion(null);
 
     try {
       if (modpack.source === 'modrinth' && modpack.modrinthProject) {
-        const [details, vers] = await Promise.all([
+        const [details, versions] = await Promise.all([
           getProject(modpack.modrinthProject.project_id),
           getProjectVersions(modpack.modrinthProject.project_id),
         ]);
-        setDetailBody(details.body ?? '');
-        setModrinthVersions(vers);
-        const featured = vers.find((v) => v.featured) ?? vers[0];
-        if (featured) setSelectedModrinthVersion(featured);
+        setDetailBody(details.body ?? modpack.description);
+        setModrinthVersions(versions);
+        setSelectedModrinthVersion(versions.find((version) => version.featured) ?? versions[0] ?? null);
       } else if (modpack.source === 'curseforge' && modpack.curseforgeProject) {
-        const [desc, res] = await Promise.all([
+        const [description, files] = await Promise.all([
           getCurseForgeDescription(server.uuid, modpack.curseforgeProject.id),
-          getCurseForgeFiles(server.uuid, {
-            modId: modpack.curseforgeProject.id,
-            pageSize: 50,
-          }),
+          getCurseForgeFiles(server.uuid, { modId: modpack.curseforgeProject.id, pageSize: 50 }),
         ]);
-        setDetailBody(desc);
-        setCfFiles(res.data);
-        if (res.data.length > 0) setSelectedCfFile(res.data[0]);
+        setDetailBody(description || modpack.description);
+        setCfFiles(files.data);
+        setSelectedCfFile(files.data[0] ?? null);
+      } else {
+        let versions = modpack.availableVersions ?? [];
+        if (versions.length === 0) {
+          const params = new URLSearchParams(
+            modpack.source === 'ftb' ? { pack_id: modpack.id } : { safe_name: modpack.id },
+          );
+          const response = await fetch(`/api/client/servers/${server.uuid}/content-installer/${modpack.source}/versions?${params}`);
+          if (!response.ok) throw new Error(await response.text() || 'Could not load versions');
+          const body = await response.json() as { data?: unknown[] };
+          versions = asProviderVersions(body.data);
+        }
+        setProviderVersions(versions);
+        setSelectedProviderVersion(versions[0] ?? null);
       }
-    } catch (err) {
-      addToast(`Failed to load versions: ${err instanceof Error ? err.message : 'unknown'}`, 'error');
+    } catch (error) {
+      addToast(`Failed to load versions: ${error instanceof Error ? error.message : 'unknown'}`, 'error');
     } finally {
       setVersionsLoading(false);
       setDetailLoading(false);
     }
-  }, [server.uuid]);
+  }, [addToast, server.uuid]);
 
-  // Loader info from Modrinth version
-  const loaderInfo = useMemo(() => {
-    if (!selectedModrinthVersion) return null;
-    const loaders = selectedModrinthVersion.loaders ?? [];
-    if (loaders.includes('fabric')) return { name: 'Fabric' };
-    if (loaders.includes('neoforge')) return { name: 'NeoForge' };
-    if (loaders.includes('forge')) return { name: 'Forge' };
-    if (loaders.includes('quilt')) return { name: 'Quilt' };
-    return null;
-  }, [selectedModrinthVersion]);
+  const loaderName = useMemo(() => {
+    if (selectedModpack?.source === 'modrinth' && selectedModrinthVersion) {
+      return ['neoforge', 'forge', 'fabric', 'quilt'].find((loader) => selectedModrinthVersion.loaders?.includes(loader)) ?? null;
+    }
+    if (selectedModpack?.source === 'curseforge' && selectedCfFile) {
+      const values = selectedCfFile.gameVersions?.map((value) => value.toLowerCase()) ?? [];
+      return ['neoforge', 'forge', 'fabric', 'quilt'].find((loader) => values.some((value) => value.includes(loader))) ?? null;
+    }
+    return selectedProviderVersion?.loader ?? null;
+  }, [selectedCfFile, selectedModpack?.source, selectedModrinthVersion, selectedProviderVersion]);
 
-  // Version options
   const versionOptions = useMemo(() => {
     if (selectedModpack?.source === 'modrinth') {
-      return modrinthVersions.map((v) => ({
-        value: v.id,
-        label: versionLabel(v.version_number, v.game_versions),
-      }));
+      return modrinthVersions.map((version) => ({ value: version.id, label: versionLabel(version.version_number, version.game_versions) }));
     }
-    return cfFiles.map((f) => ({
-      value: String(f.id),
-      label: versionLabel(f.displayName, f.gameVersions),
-    }));
-  }, [selectedModpack?.source, modrinthVersions, cfFiles]);
+    if (selectedModpack?.source === 'curseforge') {
+      return cfFiles.map((file) => ({ value: String(file.id), label: versionLabel(file.displayName, file.gameVersions) }));
+    }
+    return providerVersions.map((version) => ({ value: version.id, label: version.label }));
+  }, [cfFiles, modrinthVersions, providerVersions, selectedModpack?.source]);
 
-  // Size the version select to the SELECTED label so the chosen value never
-  // truncates in the closed input (#18) without reserving space for the
-  // longest option — that padded the row with dead space and squeezed the
-  // install button. The open dropdown sizes itself (width: max-content).
-  // ~7.1px/char at size sm + 60px chrome.
-  const versionSelectWidth = useMemo(() => {
-    const selectedId =
-      selectedModpack?.source === 'modrinth'
-        ? (selectedModrinthVersion?.id ?? null)
-        : selectedCfFile
-          ? String(selectedCfFile.id)
-          : null;
-    const current = versionOptions.find((o) => o.value === selectedId)?.label ?? '';
-    return Math.min(Math.max(200, Math.round(current.length * 7.1) + 60), 440);
-  }, [versionOptions, selectedModpack?.source, selectedModrinthVersion, selectedCfFile]);
+  const selectedVersionId = selectedModpack?.source === 'modrinth'
+    ? selectedModrinthVersion?.id ?? null
+    : selectedModpack?.source === 'curseforge'
+      ? selectedCfFile ? String(selectedCfFile.id) : null
+      : selectedProviderVersion?.id ?? null;
 
-  const hasVersions = selectedModpack?.source === 'modrinth' ? modrinthVersions.length > 0 : cfFiles.length > 0;
+  const hasVersions = versionOptions.length > 0;
+  const canInstall = selectedModpack?.source === 'modrinth'
+    ? !!selectedModrinthVersion && !!getPrimaryFile(selectedModrinthVersion)
+    : selectedModpack?.source === 'curseforge'
+      ? !!selectedCfFile && !!selectedCfFile.downloadUrl
+      : !!selectedProviderVersion;
 
-  // Install
   const doInstall = useCallback(async () => {
     if (!selectedModpack) return;
-
     setInstalling(true);
-
     try {
-      let endpoint: string;
+      let endpoint = '';
       let params: URLSearchParams;
 
       if (selectedModpack.source === 'modrinth') {
         if (!selectedModrinthVersion) return;
         const file = getPrimaryFile(selectedModrinthVersion);
-        if (!file) { addToast('No .mrpack file found.', 'error'); return; }
+        if (!file) throw new Error('No .mrpack file found.');
         endpoint = `/api/client/servers/${server.uuid}/content-installer/modpack/install`;
         params = new URLSearchParams({
           mrpack_url: file.url,
-          clean_install: String(cleanInstall),
+          wipe_files: String(wipeFiles),
+          delete_world: String(deleteWorld),
           modpack_name: selectedModpack.title,
           version_name: selectedModrinthVersion.version_number,
         });
-      } else {
-        if (!selectedCfFile) return;
-        if (!selectedCfFile.downloadUrl) {
-          addToast('This modpack does not allow third-party downloads.', 'error');
-          return;
-        }
+      } else if (selectedModpack.source === 'curseforge') {
+        if (!selectedCfFile?.downloadUrl) throw new Error('This CurseForge version does not allow third-party downloads.');
         endpoint = `/api/client/servers/${server.uuid}/content-installer/modpack/cf-install`;
         params = new URLSearchParams({
           zip_url: selectedCfFile.downloadUrl,
-          clean_install: String(cleanInstall),
+          wipe_files: String(wipeFiles),
+          delete_world: String(deleteWorld),
           modpack_name: selectedModpack.title,
           version_name: selectedCfFile.displayName,
         });
+      } else if (selectedModpack.source === 'ftb') {
+        if (!selectedProviderVersion) throw new Error('Select an FTB version.');
+        endpoint = `/api/client/servers/${server.uuid}/content-installer/modpack/ftb-install`;
+        params = new URLSearchParams({
+          pack_id: selectedModpack.id,
+          version_id: selectedProviderVersion.id,
+          wipe_files: String(wipeFiles),
+          delete_world: String(deleteWorld),
+          modpack_name: selectedModpack.title,
+          version_name: selectedProviderVersion.label,
+        });
+      } else {
+        if (!selectedProviderVersion) throw new Error('Select an ATLauncher version.');
+        endpoint = `/api/client/servers/${server.uuid}/content-installer/modpack/atlauncher-install`;
+        params = new URLSearchParams({
+          safe_name: selectedModpack.id,
+          version: selectedProviderVersion.id,
+          wipe_files: String(wipeFiles),
+          delete_world: String(deleteWorld),
+          modpack_name: selectedModpack.title,
+        });
       }
 
-      const res = await fetch(`${endpoint}?${params}`, { method: 'POST' });
-      if (!res.ok) throw new Error(await res.text() || `Install failed: ${res.status}`);
+      const response = await fetch(`${endpoint}?${params}`, { method: 'POST' });
+      if (!response.ok) throw new Error(await response.text() || `Install failed: ${response.status}`);
       addToast(`Installing "${selectedModpack.title}". Opening the Console for live logs.`, 'success');
       setSelectedModpack(null);
       navigate(`/server/${server.uuidShort}`);
       updateServer({ status: 'installing' });
-    } catch (err) {
-      addToast(`Modpack install failed: ${err instanceof Error ? err.message : 'unknown'}`, 'error');
+    } catch (error) {
+      addToast(`Modpack install failed: ${error instanceof Error ? error.message : 'unknown'}`, 'error');
     } finally {
       setInstalling(false);
     }
-  }, [
-    addToast,
-    cleanInstall,
-    navigate,
-    selectedCfFile,
-    selectedModpack,
-    selectedModrinthVersion,
-    server.uuid,
-    server.uuidShort,
-    updateServer,
-  ]);
-
-  const selectedFile = selectedModpack?.source === 'modrinth' && selectedModrinthVersion
-    ? getPrimaryFile(selectedModrinthVersion) : null;
+  }, [addToast, deleteWorld, navigate, selectedCfFile, selectedModpack, selectedModrinthVersion, selectedProviderVersion, server.uuid, server.uuidShort, updateServer, wipeFiles]);
 
   const sourceOptions = [
+    { value: 'all', label: 'All Sources' },
     { value: 'modrinth', label: 'Modrinth' },
     ...(cfAvailable ? [{ value: 'curseforge', label: 'CurseForge' }] : []),
+    { value: 'ftb', label: 'FTB' },
+    { value: 'atlauncher', label: 'ATLauncher' },
   ];
 
-  const canInstall = selectedModpack?.source === 'modrinth'
-    ? !!selectedModrinthVersion && !!selectedFile
-    : !!selectedCfFile && !!selectedCfFile?.downloadUrl;
+  const worldDescription = detection.worldDirs.length > 0
+    ? `Detected: ${detection.worldDirs.join(', ')}`
+    : 'No existing Minecraft world was detected.';
 
   return (
-    <div className='ci-browse'>
-      {/* Search bar */}
+    <div className='ci-browse ci-modpack-manager'>
       <div className='ci-search-bar'>
         <TextInput
-          placeholder='Search modpacks...'
+          placeholder='Search modpacks across all sources...'
           leftSection={<FontAwesomeIcon icon={faSearch} />}
           value={query}
-          onChange={(e) => setQuery(e.currentTarget.value)}
+          onChange={(event) => setQuery(event.currentTarget.value)}
           className='ci-search-input'
         />
-        {sourceOptions.length > 1 && (
-          <SegmentedControl
-            value={source}
-            onChange={(v) => setSource(v as Source)}
-            data={sourceOptions}
-          />
-        )}
         <Select
           data={[
             { value: 'relevance', label: 'Relevance' },
             { value: 'downloads', label: 'Downloads' },
-            { value: 'follows', label: 'Follows' },
             { value: 'newest', label: 'Newest' },
             { value: 'updated', label: 'Updated' },
           ]}
           value={sortBy}
-          onChange={(v) => v && setSortBy(v)}
+          onChange={(value) => value && setSortBy(value)}
           w={140}
         />
       </div>
 
-      {/* Results */}
+      <div className='ci-provider-row'>
+        <SegmentedControl value={source} onChange={(value) => setSource(value as Source)} data={sourceOptions} />
+        <Group gap='xs'>
+          {detection.loader !== 'unknown' && <Badge variant='light'>Current: {detection.loader}</Badge>}
+          {detection.mcVersion && <Badge variant='light'>MC {detection.mcVersion}</Badge>}
+        </Group>
+      </div>
+
+      {providerWarning && <Alert color='yellow' variant='light'>{providerWarning}</Alert>}
+
       {loading && results.length === 0 ? (
         <div className='ci-center'><Loader color='violet' size='lg' /></div>
       ) : results.length === 0 ? (
-        <Text c='dimmed' ta='center' mt='xl'>
-          {query ? 'No modpacks found. Try a different search.' : 'No modpacks found.'}
-        </Text>
+        <Text c='dimmed' ta='center' mt='xl'>{query ? 'No modpacks found. Try a different search.' : 'No modpacks found.'}</Text>
       ) : (
         <>
-          <div className='ci-results-grid'>
+          <div className='ci-results-grid ci-modpack-grid'>
             {results.map((modpack) => (
-              <Card
-                key={`${modpack.source}-${modpack.id}`}
-                hoverable
-                p='md'
-                className='ci-project-card'
-                onClick={() => openInstall(modpack)}
-              >
+              <Card key={`${modpack.source}-${modpack.id}`} hoverable p='md' className='ci-project-card ci-modpack-card' onClick={() => openInstall(modpack)}>
                 <div className='ci-card-header'>
-                  {modpack.iconUrl ? (
-                    <img src={modpack.iconUrl} alt='' className='ci-project-icon' />
-                  ) : (
-                    <div className='ci-project-icon ci-project-icon--placeholder' />
-                  )}
+                  {modpack.iconUrl ? <img src={modpack.iconUrl} alt='' className='ci-project-icon' /> : <div className='ci-project-icon ci-project-icon--placeholder' />}
                   <div className='ci-card-title'>
-                    <Text fw={600} size='sm' lineClamp={1}>{modpack.title}</Text>
+                    <Text fw={700} size='sm' lineClamp={1}>{modpack.title}</Text>
                     <Text size='xs' c='dimmed'>by {modpack.author}</Text>
                   </div>
+                  <Badge variant='light' color={providerColor[modpack.source]} size='xs'>{providerLabel[modpack.source]}</Badge>
                 </div>
-                <div className='ci-card-body'>
-                  <Text size='xs' c='dimmed' lineClamp={3}>{modpack.description}</Text>
-                </div>
+                <div className='ci-card-body'><Text size='xs' c='dimmed' lineClamp={3}>{modpack.description}</Text></div>
                 <div className='ci-card-footer'>
-                  <Text size='xs' c='dimmed'>
-                    {(modpack.source === 'curseforge' ? cfFormatDownloads : formatDownloads)(modpack.downloads)} downloads
-                  </Text>
-                  <Badge variant='light' color={modpack.source === 'curseforge' ? 'orange' : 'green'} size='xs'>
-                    {modpack.source === 'curseforge' ? 'CurseForge' : 'Modrinth'}
-                  </Badge>
+                  <Text size='xs' c='dimmed'>{modpack.downloads > 0 ? `${formatDownloads(modpack.downloads)} downloads` : providerLabel[modpack.source]}</Text>
+                  <Group gap={4}>
+                    {modpack.gameVersion && <Badge size='xs' variant='outline'>MC {modpack.gameVersion}</Badge>}
+                    {modpack.loaders?.slice(0, 2).map((loader) => <Badge key={loader} size='xs' variant='outline'>{loader}</Badge>)}
+                  </Group>
                 </div>
               </Card>
             ))}
           </div>
-
-          {results.length < totalHits && (
-            <Group justify='center' mt='md'>
-              <Button variant='subtle' onClick={loadMore} loading={loading}>
-                Load More ({results.length}/{totalHits})
-              </Button>
-            </Group>
-          )}
+          {hasMore && <Group justify='center' mt='md'><Button variant='subtle' onClick={loadMore} loading={loading}>Load More</Button></Group>}
         </>
       )}
 
-      {/* Install Modal */}
       <Modal
         opened={!!selectedModpack}
         onClose={() => { if (!installing) setSelectedModpack(null); }}
@@ -441,78 +519,46 @@ export default function ModpacksTab({ detection }: ModpacksTabProps) {
       >
         {selectedModpack && (
           <Stack gap='md'>
-            {/* Header row: icon + meta left, version + install right */}
             <div className='ci-detail-top'>
               <div className='ci-detail-top-left'>
-                {selectedModpack.iconUrl ? (
-                  <img src={selectedModpack.iconUrl} alt='' className='ci-detail-icon' />
-                ) : (
-                  <div className='ci-detail-icon ci-detail-icon--placeholder' />
-                )}
+                {selectedModpack.iconUrl ? <img src={selectedModpack.iconUrl} alt='' className='ci-detail-icon' /> : <div className='ci-detail-icon ci-detail-icon--placeholder' />}
                 <div className='ci-detail-meta'>
                   <Group gap='xs' align='center'>
                     <Text fw={700} size='lg'>{selectedModpack.title}</Text>
-                    <Badge variant='light' color={selectedModpack.source === 'curseforge' ? 'orange' : 'green'} size='xs'>
-                      {selectedModpack.source === 'curseforge' ? 'CurseForge' : 'Modrinth'}
-                    </Badge>
-                    {selectedModpack.source === 'modrinth' && selectedModpack.modrinthProject && (
-                      <Button size='compact-xs' variant='subtle'
-                        leftSection={<FontAwesomeIcon icon={faExternalLink} />}
-                        onClick={(e: React.MouseEvent) => {
-                          e.stopPropagation();
-                          window.open(`https://modrinth.com/modpack/${selectedModpack.modrinthProject!.slug}`, '_blank', 'noopener');
-                        }}>View</Button>
-                    )}
-                    {selectedModpack.source === 'curseforge' && selectedModpack.curseforgeProject && (
-                      <Button size='compact-xs' variant='subtle'
-                        leftSection={<FontAwesomeIcon icon={faExternalLink} />}
-                        onClick={(e: React.MouseEvent) => {
-                          e.stopPropagation();
-                          window.open(`https://www.curseforge.com/minecraft/modpacks/${selectedModpack.curseforgeProject!.slug}`, '_blank', 'noopener');
-                        }}>View</Button>
+                    <Badge variant='light' color={providerColor[selectedModpack.source]} size='xs'>{providerLabel[selectedModpack.source]}</Badge>
+                    {(selectedModpack.websiteUrl || selectedModpack.modrinthProject || selectedModpack.curseforgeProject) && (
+                      <Button size='compact-xs' variant='subtle' leftSection={<FontAwesomeIcon icon={faExternalLink} />} onClick={(event: React.MouseEvent) => {
+                        event.stopPropagation();
+                        const url = selectedModpack.websiteUrl
+                          ?? (selectedModpack.source === 'modrinth' && selectedModpack.modrinthProject ? `https://modrinth.com/modpack/${selectedModpack.modrinthProject.slug}` : null)
+                          ?? (selectedModpack.source === 'curseforge' && selectedModpack.curseforgeProject ? `https://www.curseforge.com/minecraft/modpacks/${selectedModpack.curseforgeProject.slug}` : null);
+                        if (url) window.open(url, '_blank', 'noopener');
+                      }}>Open</Button>
                     )}
                   </Group>
                   <Group gap='xs'>
                     <Text size='xs' c='dimmed'>by {selectedModpack.author}</Text>
-                    <Text size='xs' c='dimmed'>&middot;</Text>
-                    <Text size='xs' c='dimmed'>
-                      {(selectedModpack.source === 'curseforge' ? cfFormatDownloads : formatDownloads)(selectedModpack.downloads)} downloads
-                    </Text>
-                    {selectedModpack.source === 'modrinth' && selectedModrinthVersion && (
-                      <>
-                        <Text size='xs' c='dimmed'>&middot;</Text>
-                        <Text size='xs' c='dimmed'>{timeAgo(selectedModrinthVersion.date_published)}</Text>
-                      </>
-                    )}
-                    {loaderInfo && <Badge variant='light' color='violet' size='xs'>{loaderInfo.name}</Badge>}
+                    {selectedModpack.downloads > 0 && <Text size='xs' c='dimmed'>· {formatDownloads(selectedModpack.downloads)} downloads</Text>}
+                    {selectedModpack.source === 'modrinth' && selectedModrinthVersion && <Text size='xs' c='dimmed'>· {timeAgo(selectedModrinthVersion.date_published)}</Text>}
+                    {loaderName && <Badge variant='light' color='violet' size='xs'>{loaderName}</Badge>}
                   </Group>
                 </div>
               </div>
 
               <div className='ci-detail-top-right'>
-                {versionsLoading ? (
-                  <Loader color='violet' size='xs' />
-                ) : !hasVersions ? (
-                  <Text size='xs' c='dimmed'>No versions</Text>
-                ) : (
+                {versionsLoading ? <Loader color='violet' size='xs' /> : !hasVersions ? <Text size='xs' c='dimmed'>No versions</Text> : (
                   <Select
                     placeholder='Version...'
                     data={versionOptions}
-                    value={
-                      selectedModpack.source === 'modrinth'
-                        ? (selectedModrinthVersion?.id ?? null)
-                        : (selectedCfFile ? String(selectedCfFile.id) : null)
-                    }
-                    onChange={(val) => {
-                      if (selectedModpack.source === 'modrinth') {
-                        setSelectedModrinthVersion(modrinthVersions.find((v) => v.id === val) ?? null);
-                      } else {
-                        setSelectedCfFile(cfFiles.find((f) => String(f.id) === val) ?? null);
-                      }
+                    value={selectedVersionId}
+                    onChange={(value) => {
+                      if (selectedModpack.source === 'modrinth') setSelectedModrinthVersion(modrinthVersions.find((version) => version.id === value) ?? null);
+                      else if (selectedModpack.source === 'curseforge') setSelectedCfFile(cfFiles.find((file) => String(file.id) === value) ?? null);
+                      else setSelectedProviderVersion(providerVersions.find((version) => version.id === value) ?? null);
                     }}
                     searchable
                     size='sm'
-                    w={`min(${versionSelectWidth}px, 100%)`}
+                    w='min(440px, 100%)'
                     comboboxProps={{ width: 'max-content', position: 'bottom-end' }}
                     disabled={installing}
                   />
@@ -520,69 +566,72 @@ export default function ModpacksTab({ detection }: ModpacksTabProps) {
               </div>
             </div>
 
-            {isRunning && (
-              <Alert icon={<FontAwesomeIcon icon={faExclamationTriangle} />} color='red' variant='light'>
-                Stop your server before installing a modpack.
-              </Alert>
+            {isRunning && <Alert icon={<FontAwesomeIcon icon={faExclamationTriangle} />} color='red' variant='light'>Stop your server before installing a modpack.</Alert>}
+            {!canReinstall && <Alert color='yellow' variant='light'>You need the server reinstall permission to install modpacks.</Alert>}
+            {selectedModpack.source === 'curseforge' && selectedCfFile && !selectedCfFile.downloadUrl && <Alert color='red' variant='light'>This modpack does not allow third-party downloads.</Alert>}
+
+            {detailLoading ? <div className='ci-center'><Loader color='violet' size='sm' /></div> : detailBody ? (
+              <div className='ci-detail-body' dangerouslySetInnerHTML={{
+                __html: selectedModpack.source === 'curseforge'
+                  ? detailBody
+                  : (marked.parse(detailBody, { async: false, breaks: false, gfm: true }) as string),
+              }} />
+            ) : <Text size='sm' c='dimmed'>{selectedModpack.description}</Text>}
+
+            {selectedModpack.gallery && selectedModpack.gallery.length > 0 && (
+              <div className='ci-gallery-strip'>
+                {selectedModpack.gallery.slice(0, 8).map((image, index) => (
+                  <a href={image.url} target='_blank' rel='noreferrer' key={`${image.url}-${index}`} onClick={(event) => event.stopPropagation()}>
+                    <img src={image.thumbnailUrl ?? image.url} alt='' className='ci-gallery-thumb' />
+                  </a>
+                ))}
+              </div>
             )}
 
-            {!canReinstall && (
-              <Alert color='yellow' variant='light'>
-                You need the server reinstall permission to install modpacks.
-              </Alert>
-            )}
-
-            {selectedModpack.source === 'curseforge' && selectedCfFile && !selectedCfFile.downloadUrl && (
-              <Alert color='red' variant='light'>
-                This modpack does not allow third-party downloads.
-              </Alert>
-            )}
-
-            {/* Description — trusted API content from Modrinth/CurseForge */}
-            {detailLoading ? (
-              <div className='ci-center'><Loader color='violet' size='sm' /></div>
-            ) : detailBody ? (
-              <div
-                className='ci-detail-body'
-                dangerouslySetInnerHTML={{
-                  __html: selectedModpack.source === 'curseforge'
-                    ? detailBody
-                    : (marked.parse(detailBody, { async: false, breaks: false, gfm: true }) as string),
-                }}
-              />
-            ) : (
-              <Text size='sm' c='dimmed'>{selectedModpack.description}</Text>
-            )}
-
-            {/* Bottom bar: checkboxes + install */}
             {hasVersions && !versionsLoading && (
               <>
+                <Card p='md' className='ci-install-plan'>
+                  <Stack gap='xs'>
+                    <Text fw={700}>Install plan</Text>
+                    <Group gap='xs'>
+                      <Badge variant='light'>{providerLabel[selectedModpack.source]}</Badge>
+                      {loaderName && <Badge variant='light'>Loader: {loaderName}</Badge>}
+                      {(selectedProviderVersion?.gameVersion ?? detection.mcVersion) && <Badge variant='light'>MC {selectedProviderVersion?.gameVersion ?? detection.mcVersion}</Badge>}
+                      {selectedProviderVersion?.java && <Badge variant='light'>Java {selectedProviderVersion.java}</Badge>}
+                    </Group>
+                  </Stack>
+                </Card>
                 <Checkbox
-                  label='Clean install (recommended)'
-                  description='Wipes all existing server files before installing.'
-                  checked={cleanInstall}
-                  onChange={(e) => setCleanInstall(e.currentTarget.checked)}
+                  label='Wipe old server / modpack files'
+                  description='Recommended when switching packs. Keeps detected worlds and operator files such as server.properties, whitelist, bans and ops.'
+                  checked={wipeFiles}
+                  onChange={(event) => setWipeFiles(event.currentTarget.checked)}
                   color='red'
                   disabled={installing || isRunning}
                 />
+                <Checkbox
+                  label='Delete existing world'
+                  description={worldDescription}
+                  checked={deleteWorld}
+                  onChange={(event) => setDeleteWorld(event.currentTarget.checked)}
+                  color='red'
+                  disabled={installing || isRunning || detection.worldDirs.length === 0}
+                />
+                {deleteWorld && <Alert icon={<FontAwesomeIcon icon={faExclamationTriangle} />} color='red' variant='light'>World deletion is permanent unless you have a backup. Only directories containing level.dat are targeted.</Alert>}
                 <Group justify='space-between' align='center' wrap='wrap'>
                   <Checkbox
-                    label='I understand this will replace my server files'
+                    label={deleteWorld ? 'I understand this will replace server files and delete the detected world' : 'I understand this will replace my server files'}
                     checked={acceptRisk}
-                    onChange={(e) => setAcceptRisk(e.currentTarget.checked)}
+                    onChange={(event) => setAcceptRisk(event.currentTarget.checked)}
                     disabled={installing || isRunning}
                   />
-                  <Group gap='sm'>
-                    <Button
-                      onClick={doInstall}
-                      loading={installing}
-                      disabled={!canReinstall || isRunning || !canInstall || !acceptRisk || !hasVersions}
-                      color='red'
-                      leftSection={<FontAwesomeIcon icon={faArrowDown} />}
-                    >
-                      Install Modpack
-                    </Button>
-                  </Group>
+                  <Button
+                    onClick={doInstall}
+                    loading={installing}
+                    disabled={!canReinstall || isRunning || !canInstall || !acceptRisk || !hasVersions}
+                    color='red'
+                    leftSection={<FontAwesomeIcon icon={faArrowDown} />}
+                  >Install Modpack</Button>
                 </Group>
               </>
             )}

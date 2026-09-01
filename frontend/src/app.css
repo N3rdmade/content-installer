@@ -51,6 +51,15 @@
   flex: 1;
 }
 
+.ci-provider-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+  margin-top: 10px;
+}
+
 /* Card grid */
 .ci-results-grid {
   display: grid;
@@ -59,10 +68,24 @@
   margin-top: 12px;
 }
 
+.ci-modpack-grid {
+  gap: 14px;
+}
+
 .ci-project-card {
   display: flex;
   flex-direction: column;
   min-height: 0;
+}
+
+.ci-modpack-card {
+  min-height: 178px;
+  transition: transform 120ms ease, border-color 120ms ease, box-shadow 120ms ease;
+}
+
+.ci-modpack-card:hover {
+  transform: translateY(-2px);
+  box-shadow: var(--mantine-shadow-sm);
 }
 
 .ci-card-header {
@@ -98,8 +121,37 @@
 .ci-card-footer {
   display: flex;
   align-items: center;
+  justify-content: space-between;
   gap: 8px;
   flex-wrap: wrap;
+}
+
+.ci-install-plan {
+  border-color: var(--mantine-color-default-border);
+  background: color-mix(in srgb, var(--mantine-color-body) 92%, var(--mantine-color-violet-6) 8%);
+}
+
+.ci-gallery-strip {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
+  gap: 8px;
+  max-width: 874px;
+  width: 100%;
+  margin: 0 auto 8px;
+}
+
+.ci-gallery-strip a {
+  display: block;
+  min-width: 0;
+}
+
+.ci-gallery-thumb {
+  display: block;
+  width: 100%;
+  height: 96px;
+  object-fit: cover;
+  border-radius: 8px;
+  border: 1px solid var(--mantine-color-default-border);
 }
 
 /* Modal - no header, just floating X */
@@ -144,12 +196,10 @@
   gap: 8px;
   flex-wrap: wrap;
   min-width: 0;
-  margin-right: 32px; /* clearance for the floating modal X */
+  margin-right: 32px;
   margin-top: 6px;
 }
 
-/* Never let the install button get squeezed by a long version label — the
-   select yields (wraps) first. */
 .ci-detail-top-right .mantine-Button-root {
   flex-shrink: 0;
 }
@@ -187,7 +237,6 @@
   max-height: 60vh;
   overflow-y: auto;
   margin-bottom: 16px;
-  /* Modrinth caps its description column at 874px; narrower screens scale naturally (#15) */
   max-width: 874px;
   margin-left: auto;
   margin-right: auto;
@@ -271,14 +320,12 @@
   max-width: 340px;
 }
 
-/* Two-up on wide screens, single column below ~1100px */
 .ci-installed-grid {
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(480px, 1fr));
   gap: 6px;
 }
 
-/* Filter bar (browse, #14) */
 .ci-filter-bar {
   display: flex;
   align-items: center;
@@ -288,9 +335,6 @@
   margin-bottom: 12px;
 }
 
-/* Mantine Card root is display:flex + flex-direction:column (for Card.Section).
-   Direction must be forced back to row, and the selector needs two classes so it
-   out-ranks Mantine's own single-class rule regardless of stylesheet order. */
 .ci-installed-grid .ci-installed-card {
   display: flex;
   flex-direction: row;
@@ -335,9 +379,19 @@
     grid-template-columns: 1fr;
   }
 
-  .ci-search-bar {
+  .ci-search-bar,
+  .ci-provider-row {
     flex-direction: column;
     align-items: stretch;
+  }
+
+  .ci-provider-row .mantine-SegmentedControl-root {
+    width: 100%;
+    overflow-x: auto;
+  }
+
+  .ci-gallery-strip {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 
   .ci-installed-grid {

@@ -1,5 +1,10 @@
+mod atlauncher;
 mod curseforge;
+mod ftb;
 mod install_script;
+mod provider_install;
+mod provider_routes;
+mod runtime;
 mod settings;
 
 use axum::{extract::Query, http::StatusCode, response::IntoResponse};
@@ -13,10 +18,23 @@ use shared::{
     },
     State,
 };
-use std::sync::Arc;
+use std::{collections::HashSet, sync::Arc};
 
 /// CurseForge API keys are bcrypt hashes and always this long.
 const CF_API_KEY_LEN: usize = 60;
+
+/// Files that belong to the server/operator rather than a specific modpack.
+/// These survive a normal "wipe old server files" operation. Worlds are
+/// detected separately by looking for level.dat instead of assuming their names.
+const PRESERVED_SERVER_FILES: &[&str] = &[
+    "server.properties",
+    "eula.txt",
+    "ops.json",
+    "whitelist.json",
+    "banned-ips.json",
+    "banned-players.json",
+    "usercache.json",
+];
 
 #[derive(Default)]
 pub struct ExtensionStruct;
@@ -73,12 +91,36 @@ impl Extension for ExtensionStruct {
                         axum::routing::get(curseforge::description),
                     )
                     .route(
+                        "/content-installer/ftb/search",
+                        axum::routing::get(ftb::search),
+                    )
+                    .route(
+                        "/content-installer/ftb/versions",
+                        axum::routing::get(ftb::versions),
+                    )
+                    .route(
+                        "/content-installer/atlauncher/search",
+                        axum::routing::get(atlauncher::search),
+                    )
+                    .route(
+                        "/content-installer/atlauncher/versions",
+                        axum::routing::get(atlauncher::versions),
+                    )
+                    .route(
                         "/content-installer/modpack/install",
                         axum::routing::post(modpack_install),
                     )
                     .route(
                         "/content-installer/modpack/cf-install",
                         axum::routing::post(cf_modpack_install),
+                    )
+                    .route(
+                        "/content-installer/modpack/ftb-install",
+                        axum::routing::post(provider_routes::ftb_install),
+                    )
+                    .route(
+                        "/content-installer/modpack/atlauncher-install",
+                        axum::routing::post(provider_routes::atlauncher_install),
                     )
             })
             .add_admin_api_router(|router| {
@@ -108,7 +150,6 @@ async fn admin_get_settings(
     let ext = settings
         .find_extension_settings::<settings::ContentInstallerSettings>()
         .map_err(|_| err(StatusCode::INTERNAL_SERVER_ERROR, "Settings not found"))?;
-    // Mask the API key for display
     let masked = if ext.curseforge_api_key.is_empty() {
         String::new()
     } else {
@@ -119,11 +160,6 @@ async fn admin_get_settings(
             "*".repeat(key.len())
         }
     };
-    // CurseForge keys are bcrypt strings: exactly 60 chars, `$2a$10$...`, no whitespace.
-    // The mask above only shows first-4 and last-4, so a key that lost or gained characters
-    // in the middle looks identical to a good one — which is the failure mode in #22, where
-    // re-pasting from the same bad source reproduced it every time. Length is the signal the
-    // mask cannot carry, so report it and let the admin UI compare against 60.
     let key_len = ext.curseforge_api_key.chars().count();
     let malformed = !ext.curseforge_api_key.is_empty()
         && (!ext.curseforge_api_key.starts_with("$2a$")
@@ -157,10 +193,6 @@ async fn admin_put_settings(
         .map_err(|_| err(StatusCode::INTERNAL_SERVER_ERROR, "Settings not found"))?;
 
     if let Some(key) = body.curseforge_api_key {
-        // Trim before storing. A key pasted with a trailing newline is not a legal header
-        // value, so reqwest fails at build time and the user gets "CurseForge request
-        // failed: builder error" — which says nothing about the real problem (#22).
-        // Surrounding spaces are harmless (headers strip OWS) but there is no reason to keep them.
         ext.curseforge_api_key = key.trim().into();
     }
 
@@ -200,6 +232,109 @@ fn err(status: StatusCode, msg: impl Into<String>) -> (StatusCode, String) {
     (status, msg.into())
 }
 
+async fn list_server_directory(
+    wings: &wings_api::client::WingsClient,
+    server_uuid: uuid::Uuid,
+    directory: &str,
+) -> Result<Vec<wings_api::DirectoryEntry>, (StatusCode, String)> {
+    let result = wings
+        .get_servers_server_files_list(
+            server_uuid,
+            &wings_api::servers_server_files_list::get::Query {
+                directory: Some(directory.into()),
+                per_page: Some(1000),
+                page: Some(1),
+                ..Default::default()
+            },
+        )
+        .await
+        .map_err(|e| err(StatusCode::BAD_GATEWAY, format!("Wings file listing failed: {e:?}")))?;
+
+    Ok(result.entries)
+}
+
+async fn detect_worlds_and_uncertain_dirs(
+    wings: &wings_api::client::WingsClient,
+    server_uuid: uuid::Uuid,
+    root_entries: &[wings_api::DirectoryEntry],
+) -> (HashSet<String>, HashSet<String>) {
+    let mut worlds = HashSet::new();
+    let mut uncertain = HashSet::new();
+
+    for entry in root_entries.iter().filter(|entry| entry.directory) {
+        let name = entry.name.to_string();
+        let path = format!("/{name}");
+        match list_server_directory(wings, server_uuid, &path).await {
+            Ok(entries) => {
+                if entries.iter().any(|child| child.file && child.name.as_str() == "level.dat") {
+                    worlds.insert(name);
+                }
+            }
+            Err(_) => {
+                uncertain.insert(name);
+            }
+        }
+    }
+
+    (worlds, uncertain)
+}
+
+async fn prepare_server_for_modpack(
+    wings: &wings_api::client::WingsClient,
+    server_uuid: uuid::Uuid,
+    wipe_files: bool,
+    delete_world: bool,
+) -> Result<Vec<String>, (StatusCode, String)> {
+    if !wipe_files && !delete_world {
+        return Ok(Vec::new());
+    }
+
+    let root_entries = list_server_directory(wings, server_uuid, "/").await?;
+    let (worlds, uncertain_dirs) =
+        detect_worlds_and_uncertain_dirs(wings, server_uuid, &root_entries).await;
+
+    let mut delete_names: Vec<compact_str::CompactString> = Vec::new();
+
+    for entry in &root_entries {
+        let name = entry.name.as_str();
+        let is_world = worlds.contains(name);
+
+        if is_world {
+            if delete_world {
+                delete_names.push(entry.name.clone());
+            }
+            continue;
+        }
+
+        if wipe_files {
+            if PRESERVED_SERVER_FILES.contains(&name) {
+                continue;
+            }
+            if entry.directory && uncertain_dirs.contains(name) {
+                continue;
+            }
+            delete_names.push(entry.name.clone());
+        }
+    }
+
+    if !delete_names.is_empty() {
+        wings
+            .post_servers_server_files_delete(
+                server_uuid,
+                &wings_api::servers_server_files_delete::post::RequestBody {
+                    root: "/".into(),
+                    files: delete_names,
+                },
+            )
+            .await
+            .map_err(|e| err(StatusCode::BAD_GATEWAY, format!("Wings cleanup failed: {e:?}")))?;
+    }
+
+    let mut detected_worlds: Vec<String> = worlds.into_iter().collect();
+    detected_worlds.sort();
+    Ok(detected_worlds)
+}
+
 #[derive(Deserialize)]
 struct InstallParams {
     url: String,
@@ -207,7 +342,6 @@ struct InstallParams {
     directory: String,
 }
 
-/// POST: Download a plugin/mod file to the server
 async fn install_content(
     state: GetState,
     permissions: GetPermissionManager,
@@ -294,7 +428,6 @@ async fn install_content(
     })))
 }
 
-/// GET: Check download progress
 async fn install_status(
     state: GetState,
     _permissions: GetPermissionManager,
@@ -333,7 +466,6 @@ struct RemoveParams {
     directory: String,
 }
 
-/// POST: Remove a plugin/mod file
 async fn remove_content(
     state: GetState,
     permissions: GetPermissionManager,
@@ -389,11 +521,11 @@ async fn remove_content(
 
 #[derive(Deserialize)]
 struct ModpackInstallParams {
-    /// URL to the .mrpack file on cdn.modrinth.com
     mrpack_url: String,
-    /// Whether to wipe the server first
+    #[serde(default, alias = "clean_install")]
+    wipe_files: bool,
     #[serde(default)]
-    clean_install: bool,
+    delete_world: bool,
     #[serde(default)]
     modpack_name: Option<String>,
     #[serde(default)]
@@ -413,7 +545,6 @@ fn install_label(value: Option<&str>, fallback: &str) -> String {
         .collect()
 }
 
-/// POST: Install a Modrinth modpack (.mrpack).
 async fn modpack_install(
     state: GetState,
     permissions: GetPermissionManager,
@@ -427,14 +558,16 @@ async fn modpack_install(
     permissions
         .has_server_permission("settings.install")
         .map_err(|_| err(StatusCode::FORBIDDEN, "Missing settings.install permission"))?;
+    if params.wipe_files || params.delete_world {
+        permissions
+            .has_server_permission("files.delete")
+            .map_err(|_| err(StatusCode::FORBIDDEN, "Missing files.delete permission"))?;
+    }
 
-    // Validate mrpack URL is from Modrinth CDN
     if !is_https_url_from(&params.mrpack_url, MODRINTH_PACK_HOSTS) {
         return Err(err(StatusCode::BAD_REQUEST, "mrpack URL must be from cdn.modrinth.com"));
     }
 
-    // Refuse while the server itself is installing/restoring: the panel owns
-    // that flag and `Server::install` re-checks it transactionally.
     if server.status.is_some() {
         return Err(err(
             StatusCode::CONFLICT,
@@ -442,13 +575,30 @@ async fn modpack_install(
         ));
     }
 
+    let node = server
+        .node
+        .fetch_cached(&state.database)
+        .await
+        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")))?;
+    let wings = node
+        .api_client(&state.database)
+        .await
+        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")))?;
+    let detected_worlds = prepare_server_for_modpack(
+        &wings,
+        server.uuid,
+        params.wipe_files,
+        params.delete_world,
+    )
+    .await?;
+
     let modpack_name = install_label(params.modpack_name.as_deref(), "Modrinth modpack");
     let version_name = install_label(params.version_name.as_deref(), "Selected version");
 
     server
         .install(
             &state,
-            params.clean_install,
+            false,
             Some(install_script::modrinth_script(
                 &params.mrpack_url,
                 &modpack_name,
@@ -470,7 +620,9 @@ async fn modpack_install(
                 "source": "modrinth",
                 "modpack": modpack_name,
                 "version": version_name,
-                "clean_install": params.clean_install,
+                "wipe_files": params.wipe_files,
+                "delete_world": params.delete_world,
+                "detected_worlds": detected_worlds,
             }),
         )
         .await;
@@ -480,19 +632,17 @@ async fn modpack_install(
 
 #[derive(Deserialize)]
 struct CfModpackInstallParams {
-    /// CurseForge CDN URL to the modpack zip
     zip_url: String,
+    #[serde(default, alias = "clean_install")]
+    wipe_files: bool,
     #[serde(default)]
-    clean_install: bool,
+    delete_world: bool,
     #[serde(default)]
     modpack_name: Option<String>,
     #[serde(default)]
     version_name: Option<String>,
 }
 
-/// POST: Install a CurseForge modpack. Same native Wings install flow; the
-/// script receives the CurseForge API key through its environment to resolve
-/// file download URLs.
 async fn cf_modpack_install(
     state: GetState,
     permissions: GetPermissionManager,
@@ -506,6 +656,11 @@ async fn cf_modpack_install(
     permissions
         .has_server_permission("settings.install")
         .map_err(|_| err(StatusCode::FORBIDDEN, "Missing settings.install permission"))?;
+    if params.wipe_files || params.delete_world {
+        permissions
+            .has_server_permission("files.delete")
+            .map_err(|_| err(StatusCode::FORBIDDEN, "Missing files.delete permission"))?;
+    }
 
     if !is_https_url_from(&params.zip_url, CURSEFORGE_PACK_HOSTS) {
         return Err(err(StatusCode::BAD_REQUEST, "URL must be from CurseForge CDN"));
@@ -518,7 +673,6 @@ async fn cf_modpack_install(
         ));
     }
 
-    // The install script needs the CurseForge API key to resolve downloads.
     let cf_api_key = {
         let settings_guard = state
             .settings
@@ -534,13 +688,30 @@ async fn cf_modpack_install(
         ext.curseforge_api_key.to_string()
     };
 
+    let node = server
+        .node
+        .fetch_cached(&state.database)
+        .await
+        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")))?;
+    let wings = node
+        .api_client(&state.database)
+        .await
+        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")))?;
+    let detected_worlds = prepare_server_for_modpack(
+        &wings,
+        server.uuid,
+        params.wipe_files,
+        params.delete_world,
+    )
+    .await?;
+
     let modpack_name = install_label(params.modpack_name.as_deref(), "CurseForge modpack");
     let version_name = install_label(params.version_name.as_deref(), "Selected version");
 
     server
         .install(
             &state,
-            params.clean_install,
+            false,
             Some(install_script::curseforge_script(
                 &params.zip_url,
                 &cf_api_key,
@@ -563,7 +734,9 @@ async fn cf_modpack_install(
                 "source": "curseforge",
                 "modpack": modpack_name,
                 "version": version_name,
-                "clean_install": params.clean_install,
+                "wipe_files": params.wipe_files,
+                "delete_world": params.delete_world,
+                "detected_worlds": detected_worlds,
             }),
         )
         .await;

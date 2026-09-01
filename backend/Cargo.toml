@@ -16,6 +16,7 @@ compact_str = { workspace = true }
 tokio = { workspace = true }
 reqwest = { workspace = true }
 anyhow = { workspace = true }
+uuid = { workspace = true }
 url = "2"
 urlencoding = "2"
 indexmap = { workspace = true }
