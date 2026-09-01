@@ -2,6 +2,7 @@ import { faPuzzlePiece } from '@fortawesome/free-solid-svg-icons';
 import { Extension, ExtensionContext } from 'shared';
 import AdminConfigPage from './AdminConfigPage.tsx';
 import ContentInstallerPage from './ContentInstallerPage.tsx';
+import ServerArtworkEnhancer from './ServerArtworkEnhancer.tsx';
 
 class N3rdmadeContentManager extends Extension {
   public cardConfigurationPage = AdminConfigPage;
@@ -14,6 +15,8 @@ class N3rdmadeContentManager extends Extension {
       element: ContentInstallerPage,
       permission: 'files.create',
     });
+
+    ctx.extensionRegistry.global.appendComponent(ServerArtworkEnhancer);
   }
 }
 
