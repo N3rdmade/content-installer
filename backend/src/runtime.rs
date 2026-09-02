@@ -117,22 +117,11 @@ fn select_image(egg: &NestEgg, java: u8) -> Option<String> {
     egg.docker_images.values().next().map(ToString::to_string)
 }
 
-fn concrete_startup(loader: &str, mc: Option<&str>) -> String {
+fn concrete_startup(loader: &str, _mc: Option<&str>) -> String {
     match loader {
-        "forge" => {
-            let old = mc.is_some_and(|mc| {
-                let (_, minor, _) = version_parts(mc);
-                minor > 0 && minor < 17
-            });
-            if old {
-                "java -Xms128M -XX:MaxRAMPercentage=92.5 -jar server.jar nogui".into()
-            } else {
-                "java -Xms128M -XX:MaxRAMPercentage=92.5 @user_jvm_args.txt @unix_args.txt nogui".into()
-            }
-        }
-        "neoforge" => "java -Xms128M -XX:MaxRAMPercentage=92.5 @user_jvm_args.txt @unix_args.txt nogui".into(),
+        "forge" | "neoforge" => "if [ -f startserver.sh ]; then bash startserver.sh; elif [ -f start.sh ]; then bash start.sh; elif [ -f run.sh ]; then bash run.sh; elif [ -f unix_args.txt ] && [ -f user_jvm_args.txt ]; then java @user_jvm_args.txt @unix_args.txt nogui; elif [ -f unix_args.txt ]; then java -Xms128M -XX:MaxRAMPercentage=92.5 @unix_args.txt nogui; elif [ -f server.jar ]; then java -Xms128M -XX:MaxRAMPercentage=92.5 -jar server.jar nogui; else echo 'No supported server launcher was found'; exit 1; fi".into(),
         "fabric" | "quilt" | "paper" | "purpur" | "spigot" | "vanilla" => {
-            "java -Xms128M -XX:MaxRAMPercentage=92.5 -jar server.jar nogui".into()
+            "if [ -f startserver.sh ]; then bash startserver.sh; elif [ -f start.sh ]; then bash start.sh; elif [ -f run.sh ]; then bash run.sh; elif [ -f server.jar ]; then java -Xms128M -XX:MaxRAMPercentage=92.5 -jar server.jar nogui; else echo 'No supported server launcher was found'; exit 1; fi".into()
         }
         _ => "java -Xms128M -XX:MaxRAMPercentage=92.5 -jar server.jar nogui".into(),
     }

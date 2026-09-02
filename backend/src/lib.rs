@@ -644,6 +644,7 @@ async fn modpack_install(
                 &params.mrpack_url,
                 &modpack_name,
                 &version_name,
+                applied_runtime.as_ref().map(|runtime| runtime.java).unwrap_or(21),
             )),
         )
         .await
@@ -763,6 +764,7 @@ async fn cf_modpack_install(
                 &cf_api_key,
                 &modpack_name,
                 &version_name,
+                applied_runtime.as_ref().map(|runtime| runtime.java).unwrap_or(21),
             )),
         )
         .await

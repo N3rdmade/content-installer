@@ -3,12 +3,18 @@
 use wings_api::InstallationScript;
 
 /// Non-bash entrypoint: Wings runs `/bin/bash /path/script`.
-const CONTAINER_IMAGE: &str = "python:3.12-slim";
+fn container_image(java: u8) -> &'static str {
+    match java {
+        8 => "eclipse-temurin:8-jdk-jammy",
+        21.. => "eclipse-temurin:21-jdk-jammy",
+        _ => "eclipse-temurin:17-jdk-jammy",
+    }
+}
 const ENTRYPOINT: &str = "/bin/bash";
 
 fn bash_wrapper(python: &str) -> String {
     format!(
-        "#!/bin/bash\nset -e\npython3 - <<'CI_INSTALLER_PYTHON'\n{}\nCI_INSTALLER_PYTHON\n",
+        "#!/bin/bash\nset -e\napt-get update -qq\nDEBIAN_FRONTEND=noninteractive apt-get install -y -qq python3 ca-certificates\npython3 - <<'CI_INSTALLER_PYTHON'\n{}\nCI_INSTALLER_PYTHON\n",
         python
     )
 }
@@ -18,6 +24,7 @@ pub fn modrinth_script(
     mrpack_url: &str,
     modpack_name: &str,
     version_name: &str,
+    java: u8,
 ) -> InstallationScript {
     let mut environment = indexmap::IndexMap::new();
     environment.insert(
@@ -36,7 +43,7 @@ pub fn modrinth_script(
     let script = format!("{}\n{}", PYTHON_COMMON, MODRINTH_PYTHON);
 
     InstallationScript {
-        container_image: compact_str::CompactString::from(CONTAINER_IMAGE),
+        container_image: compact_str::CompactString::from(container_image(java)),
         entrypoint: compact_str::CompactString::from(ENTRYPOINT),
         script: compact_str::CompactString::from(bash_wrapper(&script)),
         environment,
@@ -49,6 +56,7 @@ pub fn curseforge_script(
     cf_api_key: &str,
     modpack_name: &str,
     version_name: &str,
+    java: u8,
 ) -> InstallationScript {
     let mut environment = indexmap::IndexMap::new();
     environment.insert(
@@ -71,14 +79,14 @@ pub fn curseforge_script(
     let script = format!("{}\n{}", PYTHON_COMMON, CURSEFORGE_PYTHON);
 
     InstallationScript {
-        container_image: compact_str::CompactString::from(CONTAINER_IMAGE),
+        container_image: compact_str::CompactString::from(container_image(java)),
         entrypoint: compact_str::CompactString::from(ENTRYPOINT),
         script: compact_str::CompactString::from(bash_wrapper(&script)),
         environment,
     }
 }
 
-const PYTHON_COMMON: &str = r###"import datetime, hashlib, json, os, re, shutil, sys, time, tomllib, urllib.request, zipfile
+const PYTHON_COMMON: &str = r###"import datetime, hashlib, json, os, re, shutil, subprocess, sys, time, tomllib, urllib.request, zipfile
 from pathlib import Path
 
 WORKSPACE = Path("/mnt/server")
@@ -342,24 +350,22 @@ def required_dep_ids(jars):
     return required
 
 
-def mcjars_zip(kind, mc, requested):
-    data = get_json(f"https://versions.mcjars.app/api/v2/builds/{kind}/{mc}")
-    builds = data.get("builds") or []
-    if not builds:
-        raise RuntimeError(f"no {kind} builds available for Minecraft {mc}")
-    exact = next(
-        (
-            build
-            for build in builds
-            if str(build.get("projectVersionId", "")) == requested
-            or str(build.get("name", "")) == requested
-        ),
-        None,
-    )
-    if exact and exact.get("zipUrl"):
-        return exact["zipUrl"]
-    log(f"exact {kind} loader {requested} is unavailable; using {builds[0].get('name', 'latest')}")
-    return builds[0]["zipUrl"]
+def forge_installer_url(mc, requested):
+    version = str(requested or "").strip()
+    if not version:
+        raise RuntimeError(f"Forge version was not supplied for Minecraft {mc}")
+    full = version if version.startswith(f"{mc}-") else f"{mc}-{version}"
+    return f"https://maven.minecraftforge.net/net/minecraftforge/forge/{full}/forge-{full}-installer.jar"
+
+
+def neoforge_installer_url(mc, requested):
+    version = str(requested or "").strip()
+    if not version:
+        raise RuntimeError(f"NeoForge version was not supplied for Minecraft {mc}")
+    if mc == "1.20.1":
+        full = version if version.startswith("1.20.1-") else f"1.20.1-{version}"
+        return f"https://maven.neoforged.net/releases/net/neoforged/forge/{full}/forge-{full}-installer.jar"
+    return f"https://maven.neoforged.net/releases/net/neoforged/neoforge/{version}/neoforge-{version}-installer.jar"
 
 
 def apply_overrides(src_dir):
@@ -385,14 +391,44 @@ def apply_overrides(src_dir):
         log(f"applied override {name}")
 
 
-def install_loader(url, is_zip, ltype):
-    if is_zip:
-        download(url, WORKSPACE / "_loader_install.zip")
-        with zipfile.ZipFile(WORKSPACE / "_loader_install.zip") as z:
-            extract_safely(z, WORKSPACE)
-        (WORKSPACE / "_loader_install.zip").unlink(missing_ok=True)
+def install_loader(url, run_installer, ltype):
+    if run_installer:
+        installer = WORKSPACE / "_loader_installer.jar"
+        download(url, installer)
+        log(f"running official {ltype} server installer")
+        subprocess.run(
+            ["java", "-jar", str(installer), "--installServer"],
+            cwd=WORKSPACE,
+            check=True,
+        )
+        installer.unlink(missing_ok=True)
+
+        args = []
+        if ltype == "FORGE":
+            args.extend(WORKSPACE.glob("libraries/net/minecraftforge/forge/*/unix_args.txt"))
+        if ltype == "NEOFORGE":
+            args.extend(WORKSPACE.glob("libraries/net/neoforged/neoforge/*/unix_args.txt"))
+            args.extend(WORKSPACE.glob("libraries/net/neoforged/forge/*/unix_args.txt"))
+
+        if args:
+            unix_args = WORKSPACE / "unix_args.txt"
+            unix_args.unlink(missing_ok=True)
+            unix_args.symlink_to(args[0].relative_to(WORKSPACE))
+            jvm_args = WORKSPACE / "user_jvm_args.txt"
+            if not jvm_args.exists():
+                jvm_args.write_text("-Xms128M
+-XX:MaxRAMPercentage=92.5
+", encoding="utf-8")
+        elif ltype == "FORGE":
+            jars = [
+                path for path in WORKSPACE.glob("forge-*.jar")
+                if not path.name.endswith("-installer.jar")
+            ]
+            if jars:
+                shutil.copy2(jars[0], WORKSPACE / "server.jar")
     else:
         download(url, WORKSPACE / "server.jar")
+
     return ltype
 
 
@@ -410,9 +446,9 @@ def resolve_loader(deps, mc):
             "QUILT",
         )
     if "neoforge" in deps:
-        return (mcjars_zip("NEOFORGE", mc, str(deps["neoforge"])), True, "NEOFORGE")
+        return (neoforge_installer_url(mc, deps["neoforge"]), True, "NEOFORGE")
     if "forge" in deps:
-        return (mcjars_zip("FORGE", mc, str(deps["forge"])), True, "FORGE")
+        return (forge_installer_url(mc, deps["forge"]), True, "FORGE")
     return None
 
 
@@ -812,6 +848,7 @@ mod tests {
             "secret-key",
             "Example Pack",
             "1.0.0",
+            17,
         );
 
         assert!(!script.script.contains("secret-key"));
@@ -831,6 +868,7 @@ mod tests {
             "https://cdn.modrinth.com/data/example/pack.mrpack",
             "Example Pack",
             "1.0.0",
+            17,
         );
 
         assert_eq!(script.container_image.as_str(), CONTAINER_IMAGE);
